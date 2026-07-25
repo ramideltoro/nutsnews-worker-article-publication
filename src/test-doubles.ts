@@ -18,6 +18,7 @@ import {
   type BrokerPublishReceipt,
   type RuntimeBrokerTransport,
   type RuntimeClock,
+  type RuntimeMessageContext,
   type RuntimeIdempotencyClaimContext,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
@@ -33,6 +34,8 @@ import {
   loadPublicationConfig
 } from "./config.js";
 import type {
+  PublicationBackendCommandMetadata,
+  PublicationBackendOperation,
   PublicationBrokerOutbox,
   PublicationDatabase,
   PublicationDatabaseTransaction,
@@ -58,6 +61,10 @@ import {
   BACKEND_CAPTURED_PUBLICATION_POLICY,
   evaluatePolicyDrivenPublicationReadiness
 } from "./publication-gate.js";
+import {
+  BACKEND_PUBLIC_FEED_SNAPSHOT_CONTRACT,
+  buildPublicFeedSnapshotCompatibility
+} from "./public-feed-snapshot.js";
 
 export class ManualPublicationClock implements RuntimeClock {
   private current: Date;
@@ -291,9 +298,21 @@ export class LocalPublicationSnapshotPublisher implements PublicationSnapshotPub
   productionWritesEnabled = false;
   singleWriterEnabled = false;
   cutoverState: "shadow" | "cutover-approved" | "rollback-active" = "shadow";
+  failNextRefresh = false;
   readonly shadowComparisons: PublicationSnapshotCommand[] = [];
   readonly productionPublishes: PublicationSnapshotCommand[] = [];
+  readonly partialRefreshFailures: PublicationSnapshotCommand[] = [];
   private readonly clock: RuntimeClock;
+  private readonly shadowReceipts = new Map<string, {
+    readonly digest: string;
+    readonly receipt: PublicationSnapshotReceipt;
+  }>();
+  private readonly productionStates = new Map<string, {
+    readonly digest: string;
+    readonly command: PublicationSnapshotCommand;
+    refreshCompleted: boolean;
+    receipt: PublicationSnapshotReceipt | undefined;
+  }>();
 
   constructor(clock: RuntimeClock = new ManualPublicationClock()) {
     this.clock = clock;
@@ -311,13 +330,39 @@ export class LocalPublicationSnapshotPublisher implements PublicationSnapshotPub
       throw new Error("shadow-publication-command-invalid");
     }
 
+    if (!sameOperations(command.backendOperations, [
+      "shadow-publication-comparison"
+    ]) || command.snapshotRefreshOperation !== undefined) {
+      throw new Error("shadow-publication-operation-scope-invalid");
+    }
+
+    const digest = commandDigest(command);
+    const existing = this.shadowReceipts.get(command.evaluationId);
+
+    if (existing !== undefined) {
+      if (existing.digest !== digest) {
+        throw new Error("shadow-publication-command-conflict");
+      }
+
+      return existing.receipt;
+    }
+
     this.shadowComparisons.push(command);
-    return {
+    const receipt: PublicationSnapshotReceipt = {
       commandId: command.evaluationId,
       mode: "shadow_comparison",
       accepted: true,
-      publishedAt: runtimeNow(this.clock)
+      publishedAt: runtimeNow(this.clock),
+      backendOperations: command.backendOperations,
+      snapshotRefreshRequested: false,
+      rollbackAvailable: command.publicFeedSnapshot.recovery.rollbackAvailable
     };
+
+    this.shadowReceipts.set(command.evaluationId, {
+      digest,
+      receipt
+    });
+    return receipt;
   }
 
   publishProductionSnapshot(command: PublicationSnapshotCommand): PublicationSnapshotReceipt {
@@ -328,16 +373,99 @@ export class LocalPublicationSnapshotPublisher implements PublicationSnapshotPub
       throw new Error("production-publication-command-not-scoped");
     }
 
+    const expectedOperations: readonly PublicationBackendOperation[] = command.snapshotRefreshRequired
+      ? [
+          "uplift-publish-articles-batch",
+          "uplift-refresh-public-feed-snapshot"
+        ]
+      : [
+          "uplift-publish-articles-batch"
+        ];
+
+    if (!sameOperations(command.backendOperations, expectedOperations)) {
+      throw new Error("production-publication-operation-scope-invalid");
+    }
+
+    if (
+      command.snapshotRefreshRequired
+      && command.snapshotRefreshOperation !== BACKEND_PUBLIC_FEED_SNAPSHOT_CONTRACT.productionRefreshOperation
+    ) {
+      throw new Error("production-public-feed-refresh-command-missing");
+    }
+
+    if (command.publicFeedSnapshot.status !== "compatible") {
+      throw new Error("public-feed-snapshot-contract-mismatch");
+    }
+
     if (!this.productionWritesEnabled || !this.singleWriterEnabled || this.cutoverState !== "cutover-approved") {
       throw new Error("production-publication-disabled");
     }
 
+    const digest = commandDigest(command);
+    const existing = this.productionStates.get(command.evaluationId);
+
+    if (existing !== undefined) {
+      if (existing.digest !== digest) {
+        throw new Error("production-publication-command-conflict");
+      }
+
+      if (existing.receipt !== undefined) {
+        return existing.receipt;
+      }
+
+      if (command.snapshotRefreshRequired && !existing.refreshCompleted) {
+        this.completeRefreshOrThrow(existing);
+      }
+
+      existing.receipt = this.productionReceipt(existing.command);
+      return existing.receipt;
+    }
+
+    const state: {
+      readonly digest: string;
+      readonly command: PublicationSnapshotCommand;
+      refreshCompleted: boolean;
+      receipt: PublicationSnapshotReceipt | undefined;
+    } = {
+      digest,
+      command,
+      refreshCompleted: !command.snapshotRefreshRequired,
+      receipt: undefined
+    };
+
+    this.productionStates.set(command.evaluationId, state);
     this.productionPublishes.push(command);
+
+    if (command.snapshotRefreshRequired) {
+      this.completeRefreshOrThrow(state);
+    }
+
+    state.receipt = this.productionReceipt(command);
+    return state.receipt;
+  }
+
+  private completeRefreshOrThrow(state: {
+    readonly command: PublicationSnapshotCommand;
+    refreshCompleted: boolean;
+  }): void {
+    if (this.failNextRefresh) {
+      this.failNextRefresh = false;
+      this.partialRefreshFailures.push(state.command);
+      throw new Error("public-feed-snapshot-refresh-partial-failure");
+    }
+
+    state.refreshCompleted = true;
+  }
+
+  private productionReceipt(command: PublicationSnapshotCommand): PublicationSnapshotReceipt {
     return {
       commandId: command.evaluationId,
       mode: "production",
       accepted: true,
-      publishedAt: runtimeNow(this.clock)
+      publishedAt: runtimeNow(this.clock),
+      backendOperations: command.backendOperations,
+      snapshotRefreshRequested: command.snapshotRefreshOperation !== undefined,
+      rollbackAvailable: command.publicFeedSnapshot.recovery.rollbackAvailable
     };
   }
 }
@@ -456,6 +584,10 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
       featureFlag
     });
     const evaluationId = `publication-evaluation:${context.envelope.idempotencyKey}`;
+    const publicFeedSnapshot = buildPublicFeedSnapshotCompatibility({
+      payload: context.payload,
+      decision
+    });
     const shadowOutput = {
       articleId: decision.articleId,
       articleVersion: decision.articleVersion,
@@ -466,7 +598,8 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
       requiredLanguageCodes: decision.requiredLanguageCodes,
       availableLanguageCodes: decision.availableLanguageCodes,
       missingLanguageCodes: decision.missingLanguageCodes,
-      snapshotRefreshRequired: decision.snapshotRefreshRequired
+      snapshotRefreshRequired: decision.snapshotRefreshRequired,
+      publicFeedSnapshot
     };
     const record: PublicationReadinessEvaluationRecord = {
       evaluationId,
@@ -485,12 +618,6 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
     return tools.withTransaction(async (transaction) => {
       const write = await tools.recordReadinessEvaluation(transaction, record);
 
-      if (write.status === "duplicate") {
-        return {
-          status: "ok"
-        };
-      }
-
       if (write.status === "conflict" || write.status === "stale") {
         return {
           status: "terminal-failure",
@@ -504,6 +631,10 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
         articleVersion: decision.articleVersion,
         finalAggregateVersion: decision.finalAggregateVersion,
         backendOperation: decision.backendOperation,
+        backendOperations: backendOperationsForDecision(decision),
+        snapshotRefreshOperation: decision.status === "ready_for_production" && decision.snapshotRefreshRequired
+          ? BACKEND_PUBLIC_FEED_SNAPSHOT_CONTRACT.productionRefreshOperation
+          : undefined,
         providerMode: decision.providerMode,
         policyVersion: decision.policyVersion,
         writeMode: decision.writeMode,
@@ -511,10 +642,19 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
         availableLanguageCodes: decision.availableLanguageCodes,
         missingLanguageCodes: decision.missingLanguageCodes,
         snapshotRefreshRequired: decision.snapshotRefreshRequired,
-        shadowOutput
+        shadowOutput,
+        publicFeedSnapshot,
+        backendMetadata: backendMetadataFromContext(context, decision)
       };
 
       if (decision.status === "ready_for_production") {
+        if (publicFeedSnapshot.status !== "compatible") {
+          return {
+            status: "terminal-failure",
+            reason: publicFeedSnapshot.reasons.find((reason) => reason.includes("mismatch")) ?? "public-feed-snapshot-contract-mismatch"
+          };
+        }
+
         await tools.publishProductionSnapshot(command);
         return {
           status: "ok"
@@ -535,6 +675,61 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
       };
     });
   }
+}
+
+function backendOperationsForDecision(decision: PublicationReadinessDecision): readonly PublicationBackendOperation[] {
+  if (decision.status !== "ready_for_production") {
+    return [
+      "shadow-publication-comparison"
+    ];
+  }
+
+  if (!decision.snapshotRefreshRequired) {
+    return [
+      "uplift-publish-articles-batch"
+    ];
+  }
+
+  return [
+    "uplift-publish-articles-batch",
+    BACKEND_PUBLIC_FEED_SNAPSHOT_CONTRACT.productionRefreshOperation
+  ];
+}
+
+function backendMetadataFromContext(
+  context: RuntimeMessageContext,
+  decision: PublicationReadinessDecision
+): PublicationBackendCommandMetadata {
+  const publicationRef = recordValue(context.payload.publicationRef);
+
+  return {
+    idempotencyKey: context.envelope.idempotencyKey,
+    messageId: context.envelope.messageId,
+    correlationId: context.envelope.correlationId,
+    pipelineRunId: stringValue(context.payload.pipelineRunId) ?? "unknown-pipeline-run",
+    stageExecutionId: stringValue(context.payload.stageExecutionId) ?? "unknown-stage-execution",
+    sourceMessageId: stringValue(context.payload.sourceMessageId) ?? context.envelope.causationId,
+    actorService: "nutsnews-worker-article-publication",
+    schemaVersion: typeof context.payload.schemaVersion === "number" ? context.payload.schemaVersion : 1,
+    operationVersion: stringValue(publicationRef.operationVersion) ?? "public-feed-snapshot-compat-v1",
+    expectedArticleVersion: decision.articleVersion
+  };
+}
+
+function sameOperations(left: readonly PublicationBackendOperation[], right: readonly PublicationBackendOperation[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function commandDigest(command: PublicationSnapshotCommand): string {
+  return JSON.stringify(command);
+}
+
+function recordValue(value: unknown): Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Readonly<Record<string, unknown>> : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
 export function createLocalPublicationDependencies(config = loadPublicationConfig()): PublicationDependencies {
@@ -631,6 +826,54 @@ export function createMinimalPublicationPayload(
       mediaType: "application/json"
     },
     processingState: "clear",
+    operationVersion: "public-feed-snapshot-compat-v1",
+    publicFeedSnapshotRequest: {
+      limit: 6,
+      offset: 0,
+      category: "all",
+      languageCode: "en"
+    },
+    publicFeedSnapshot: {
+      id: "article-001",
+      source: "example",
+      title: "Sanitized public-feed title",
+      originalUrl: "https://example.com/article-001",
+      imageUrl: "https://example.invalid/article-001.jpg",
+      publishedAt: "2026-07-23T00:00:00.000Z",
+      publishedOnSiteAt: "2026-07-23T00:00:00.000Z",
+      aiSummary: "Sanitized public-feed summary.",
+      category: "world",
+      positivityScore: 0.82,
+      status: "published",
+      snapshotRank: 1,
+      summaries: [
+        {
+          languageCode: "fr",
+          title: "Titre public sanitise",
+          summary: "Resume public sanitise."
+        },
+        {
+          languageCode: "ja",
+          title: "Sanitized Japanese title",
+          summary: "Sanitized Japanese summary."
+        },
+        {
+          languageCode: "de-CH",
+          title: "Sanitized Swiss German title",
+          summary: "Sanitized Swiss German summary."
+        },
+        {
+          languageCode: "de",
+          title: "Sanitized German title",
+          summary: "Sanitized German summary."
+        },
+        {
+          languageCode: "el",
+          title: "Sanitized Greek title",
+          summary: "Sanitized Greek summary."
+        }
+      ]
+    },
     ...recordOverride(overrides.publicationRef)
   };
   const { publicationRef: _ignoredPublicationRef, ...topLevelOverrides } = overrides;

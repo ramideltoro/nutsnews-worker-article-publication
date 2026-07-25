@@ -64,6 +64,11 @@ export {
   type PolicyDrivenPublicationInput
 } from "./publication-gate.js";
 export {
+  BACKEND_PUBLIC_FEED_SNAPSHOT_CONTRACT,
+  buildPublicFeedSnapshotCompatibility,
+  type PublicFeedSnapshotCompatibilityInput
+} from "./public-feed-snapshot.js";
+export {
   createPublicationService,
   type PublicationService
 } from "./service.js";

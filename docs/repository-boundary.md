@@ -4,7 +4,7 @@
 | --- | --- |
 | Repository | `ramideltoro/nutsnews-worker-article-publication` |
 | Owner | `@ramideltoro` |
-| Responsibility | Consume publication-readiness jobs, own policy-driven publication readiness execution, and keep live visibility behind backend-owned deployment controls and rollback criteria. |
+| Responsibility | Consume publication-readiness jobs, own policy-driven publication readiness and public-feed snapshot compatibility execution, and keep live visibility behind backend-owned deployment controls and rollback criteria. |
 | Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-article-publication`. |
 | Primary artifact | Signed GHCR image tagged only by commit SHA |
 | Support boundary | Repo-local code, tests, CI, package/image publishing, and service-local run notes. |
@@ -25,7 +25,7 @@
 - CODEOWNERS assigns repository ownership to `@ramideltoro`.
 - Default Actions token permission: read-only.
 - Publish workflows request package write permission only inside publish jobs.
-- CI installs exact worker contracts/runtime dependencies, validates policy-driven publication gate fixtures, and builds the non-root container on every push and pull request.
+- CI installs exact worker contracts/runtime dependencies, validates policy-driven publication gate and backend public-feed snapshot compatibility fixtures, and builds the non-root container on every push and pull request.
 - CodeQL and dependency review workflows validate code-bearing changes.
 - Dependabot checks GitHub Actions and npm manifests.
 - Branch protection requires pull requests, resolved conversations, and the `validate` status check where GitHub permits repository branch protection. CODEOWNERS documents ownership for reviews.

@@ -6,13 +6,14 @@ Deployable worker-uplift publication service shell for NutsNews.
 
 Consume publication-readiness jobs, keep public visibility behind backend-owned policy and deployment controls, and produce shadow comparison output until protected cutover explicitly enables production writes.
 
-This service establishes the publication runtime, health/status/metrics surface, non-root container, strict TypeScript tooling, exact contracts/runtime dependencies, injectable dependency boundaries, and local verification around least-privilege access. Backend public-feed snapshot compatibility is implemented in a later publication issue.
+This service establishes the publication runtime, health/status/metrics surface, non-root container, strict TypeScript tooling, exact contracts/runtime dependencies, injectable dependency boundaries, backend public-feed snapshot compatibility, and local verification around least-privilege access.
 
 ## Runtime Surface
 
 - Consumes the contracted `publication` route and accepts only publication-stage payloads.
 - Provides injectable inbox, readiness policy, database transaction, snapshot publisher, feature flag, broker outbox, broker transport, clock, and work-handler boundaries.
 - Evaluates readiness against the backend-captured publication policy from `worker-uplift-api-admin-compatibility-contract`.
+- Compares shadow public-feed snapshot output against the current backend `public.public_feed_snapshot` contract without creating a second authoritative snapshot schema.
 - Gates readiness on broker lifecycle, dependency probes, database write scope, and publication write-mode status.
 - Exposes `/live`, `/ready`, `/startup`, `/metrics`, `/config-schema`, and `/status`.
 - Keeps `shadow_comparison` as the hard default. Production writes require production dependency mode, configured backend/database/broker/API presence, and the protected confirmation value from backend-owned deployment.
@@ -26,11 +27,19 @@ Each publication delivery records the evaluated policy version, article version,
 
 The local fixtures cover both hold-until-complete and approved non-blocking backlog policies. Replays with the same idempotency key return the recorded decision without duplicate output; out-of-order older aggregate versions are rejected without republishing.
 
+## Public-Feed Snapshot Compatibility
+
+The captured backend snapshot contract is `worker-uplift-api-admin-compatibility-contract` version `1`. The service treats `public.public_feed_snapshot`, `load-public-feed-snapshot-rows`, and the public reader operations `load-public-feed-snapshot` and `load-home-feed-snapshot` as the compatibility target.
+
+Shadow output records sanitized stable identity hashes, rank/order by `snapshot_rank asc`, pagination, category filtering, publication/image eligibility, timestamps, localized summary availability, backend snapshot comparison, and legacy KV fallback comparison status. Shadow mode never refreshes the live materialized state and never writes Cloudflare KV.
+
+Production mode can request only scoped backend Worker API operations: `uplift-publish-articles-batch`, and `uplift-refresh-public-feed-snapshot` when a snapshot refresh is required. Partial refresh failures are retryable through the same idempotency key; replay does not duplicate the publish command.
+
 ## Shadow Safety
 
 The default service mode records a readiness evaluation and publishes shadow-comparison output only. Even a production-capable config cannot publish live snapshots through the baseline local publisher unless backend-owned runtime wiring explicitly enables cutover, production writes, and single-writer gates.
 
-When production mode is enabled by protected backend-owned runtime, the service calls only the scoped `uplift-publish-articles-batch` backend command with `backend_postgres_primary`. It does not perform direct SQL against public visibility or snapshot tables.
+When production mode is enabled by protected backend-owned runtime, the service calls only scoped backend commands with `backend_postgres_primary`. It does not perform direct SQL against public visibility or snapshot tables.
 
 The `/status` and `/config-schema` endpoints expose readiness policy, write mode, dependency presence booleans, role/identity names, and compatibility versions without retaining or returning database URLs, RabbitMQ URLs, backend API URLs, API tokens, or confirmation values.
 
