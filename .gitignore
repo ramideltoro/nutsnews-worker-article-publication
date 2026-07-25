@@ -1,6 +1,8 @@
 node_modules/
 dist/
 coverage/
+*.tgz
+*.sbom.json
 .env
 .env.*
 !.env.example
