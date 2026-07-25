@@ -19,6 +19,7 @@ import { createLocalPublicationDependencies } from "./test-doubles.js";
 
 export {
   PUBLICATION_CONFIG_SCHEMA,
+  PUBLICATION_DEFAULT_POLICY_ID,
   PUBLICATION_PRODUCTION_CONFIRMATION,
   PUBLICATION_SERVICE_NAME,
   PUBLICATION_SERVICE_VERSION,
@@ -55,6 +56,13 @@ export {
   createPublicationHttpServer,
   type PublicationHttpServer
 } from "./http.js";
+export {
+  BACKEND_CAPTURED_PUBLICATION_POLICY,
+  evaluatePolicyDrivenPublicationReadiness,
+  normalizePublicationAggregate,
+  type NormalizedPublicationAggregate,
+  type PolicyDrivenPublicationInput
+} from "./publication-gate.js";
 export {
   createPublicationService,
   type PublicationService

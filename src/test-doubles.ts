@@ -22,6 +22,7 @@ import {
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
+  type RuntimeHandlerResult,
   type RuntimeMessageDelivery,
   type RuntimeMessageProcessingResult
 } from "@ramideltoro/nutsnews-worker-runtime";
@@ -53,6 +54,10 @@ import type {
   PublicationWorkHandler,
   PublicationWorkTools
 } from "./dependencies.js";
+import {
+  BACKEND_CAPTURED_PUBLICATION_POLICY,
+  evaluatePolicyDrivenPublicationReadiness
+} from "./publication-gate.js";
 
 export class ManualPublicationClock implements RuntimeClock {
   private current: Date;
@@ -120,8 +125,10 @@ export class LocalPublicationDatabase implements PublicationDatabase {
   ];
   readonly transactions: PublicationDatabaseTransaction[] = [];
   readonly evaluations: PublicationReadinessEvaluationRecord[] = [];
+  readonly shadowOutputs: PublicationReadinessEvaluationRecord["shadowOutput"][] = [];
   failNextRecord = false;
   private readonly evaluationByKey = new Map<string, PublicationReadinessEvaluationRecord>();
+  private readonly latestByArticle = new Map<string, PublicationReadinessEvaluationRecord>();
 
   probe(): PublicationDependencyProbe {
     return {
@@ -170,18 +177,44 @@ export class LocalPublicationDatabase implements PublicationDatabase {
     const existing = this.evaluationByKey.get(record.idempotencyKey);
 
     if (existing !== undefined) {
-      return Promise.resolve({
-        status: existing.evaluationId === record.evaluationId ? "duplicate" : "conflict",
-        ...(existing.evaluationId === record.evaluationId ? {
+      const sameDecision = JSON.stringify(existing.shadowOutput) === JSON.stringify(record.shadowOutput);
+
+      if (existing.evaluationId === record.evaluationId && sameDecision) {
+        return Promise.resolve({
+          status: "duplicate",
           evaluationId: existing.evaluationId
-        } : {
-          reason: "idempotency-key-reused"
-        })
-      } as PublicationReadinessEvaluationWriteResult);
+        });
+      }
+
+      return Promise.resolve({
+        status: "conflict",
+        reason: "idempotency-key-reused"
+      });
+    }
+
+    const latest = this.latestByArticle.get(record.articleId);
+
+    if (latest !== undefined && latest.finalAggregateVersion > record.finalAggregateVersion) {
+      return Promise.resolve({
+        status: "stale",
+        reason: "stale-final-aggregate-version"
+      });
+    }
+
+    if (
+      latest?.finalAggregateVersion === record.finalAggregateVersion
+      && JSON.stringify(latest.shadowOutput) !== JSON.stringify(record.shadowOutput)
+    ) {
+      return Promise.resolve({
+        status: "conflict",
+        reason: "conflicting-publication-decision"
+      });
     }
 
     this.evaluationByKey.set(record.idempotencyKey, record);
+    this.latestByArticle.set(record.articleId, record);
     this.evaluations.push(record);
+    this.shadowOutputs.push(record.shadowOutput);
     return Promise.resolve({
       status: "recorded",
       evaluationId: record.evaluationId
@@ -196,16 +229,17 @@ export class LocalPublicationReadinessPolicy implements PublicationReadinessPoli
 
   constructor(config: PublicationConfig = loadPublicationConfig()) {
     this.policy = {
+      ...BACKEND_CAPTURED_PUBLICATION_POLICY,
       policyId: config.readiness.policyId,
-      version: "local-policy-v1",
-      source: "backend-worker-api",
       writeMode: config.writeMode,
       requiredChecks: [
         "canonical-identity",
+        "valid-enrichment-policy",
         "accepted-approval",
         "persisted-source-summary",
         "current-article-version",
-        "no-blocking-state"
+        "no-blocking-state",
+        "backend-translation-policy"
       ]
     };
   }
@@ -222,38 +256,7 @@ export class LocalPublicationReadinessPolicy implements PublicationReadinessPoli
   }
 
   evaluate(input: PublicationReadinessInput): PublicationReadinessDecision {
-    const readinessStatus = input.payload.readinessStatus;
-    const snapshotRefreshRequired = input.payload.snapshotRefreshRequired === true;
-
-    if (readinessStatus === "ready" && input.featureFlag.enabled && input.policy.writeMode === "production") {
-      return {
-        status: "ready_for_production",
-        reasons: [
-          "publication-readiness-ready",
-          "protected-production-mode"
-        ],
-        snapshotRefreshRequired
-      };
-    }
-
-    if (readinessStatus === "ready") {
-      return {
-        status: "shadow_compare_only",
-        reasons: [
-          "publication-readiness-ready",
-          "shadow-comparison-default"
-        ],
-        snapshotRefreshRequired
-      };
-    }
-
-    return {
-      status: "blocked",
-      reasons: [
-        typeof readinessStatus === "string" ? readinessStatus : "readiness-status-missing"
-      ],
-      snapshotRefreshRequired: false
-    };
+    return evaluatePolicyDrivenPublicationReadiness(input);
   }
 }
 
@@ -286,6 +289,8 @@ export class LocalPublicationSnapshotPublisher implements PublicationSnapshotPub
   readonly name = "local-publication-snapshot-publisher";
   status: PublicationDependencyProbe["status"] = "ok";
   productionWritesEnabled = false;
+  singleWriterEnabled = false;
+  cutoverState: "shadow" | "cutover-approved" | "rollback-active" = "shadow";
   readonly shadowComparisons: PublicationSnapshotCommand[] = [];
   readonly productionPublishes: PublicationSnapshotCommand[] = [];
   private readonly clock: RuntimeClock;
@@ -302,6 +307,10 @@ export class LocalPublicationSnapshotPublisher implements PublicationSnapshotPub
   }
 
   publishShadowComparison(command: PublicationSnapshotCommand): PublicationSnapshotReceipt {
+    if (command.providerMode !== "backend_postgres_shadow" || command.backendOperation !== "shadow-publication-comparison") {
+      throw new Error("shadow-publication-command-invalid");
+    }
+
     this.shadowComparisons.push(command);
     return {
       commandId: command.evaluationId,
@@ -312,7 +321,14 @@ export class LocalPublicationSnapshotPublisher implements PublicationSnapshotPub
   }
 
   publishProductionSnapshot(command: PublicationSnapshotCommand): PublicationSnapshotReceipt {
-    if (!this.productionWritesEnabled) {
+    if (
+      command.providerMode !== "backend_postgres_primary"
+      || command.backendOperation !== "uplift-publish-articles-batch"
+    ) {
+      throw new Error("production-publication-command-not-scoped");
+    }
+
+    if (!this.productionWritesEnabled || !this.singleWriterEnabled || this.cutoverState !== "cutover-approved") {
       throw new Error("production-publication-disabled");
     }
 
@@ -428,47 +444,77 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
     this.dependencies = dependencies;
   }
 
-  async handle(context: Parameters<PublicationWorkHandler["handle"]>[0], tools: PublicationWorkTools): Promise<{ readonly status: "ok" } | { readonly status: "retry"; readonly reason: string }> {
+  async handle(context: Parameters<PublicationWorkHandler["handle"]>[0], tools: PublicationWorkTools): Promise<RuntimeHandlerResult> {
     const articleId = typeof context.payload.articleId === "string" ? context.payload.articleId : context.envelope.aggregate.id;
     const policy = await this.dependencies.readinessPolicy.getCurrentPolicy();
     const featureFlag = await this.dependencies.featureFlag.resolve();
     const decision = await this.dependencies.readinessPolicy.evaluate({
       articleId,
+      envelopeArticleVersion: context.envelope.aggregate.version,
       payload: context.payload,
       policy,
       featureFlag
     });
     const evaluationId = `publication-evaluation:${context.envelope.idempotencyKey}`;
+    const shadowOutput = {
+      articleId: decision.articleId,
+      articleVersion: decision.articleVersion,
+      finalAggregateVersion: decision.finalAggregateVersion,
+      policyVersion: decision.policyVersion,
+      status: decision.status,
+      reasons: decision.reasons,
+      requiredLanguageCodes: decision.requiredLanguageCodes,
+      availableLanguageCodes: decision.availableLanguageCodes,
+      missingLanguageCodes: decision.missingLanguageCodes,
+      snapshotRefreshRequired: decision.snapshotRefreshRequired
+    };
     const record: PublicationReadinessEvaluationRecord = {
       evaluationId,
-      articleId,
+      articleId: decision.articleId,
+      articleVersion: decision.articleVersion,
+      finalAggregateVersion: decision.finalAggregateVersion,
       messageId: context.envelope.messageId,
       idempotencyKey: context.envelope.idempotencyKey,
       policy,
       decision,
-      writeMode: featureFlag.writeMode,
-      evaluatedAt: runtimeNow(this.dependencies.clock)
+      writeMode: decision.writeMode,
+      evaluatedAt: runtimeNow(this.dependencies.clock),
+      shadowOutput
     };
 
     return tools.withTransaction(async (transaction) => {
       const write = await tools.recordReadinessEvaluation(transaction, record);
 
-      if (write.status === "conflict") {
+      if (write.status === "duplicate") {
         return {
-          status: "retry",
+          status: "ok"
+        };
+      }
+
+      if (write.status === "conflict" || write.status === "stale") {
+        return {
+          status: "terminal-failure",
           reason: write.reason
         };
       }
 
       const command = {
         evaluationId,
-        articleId,
-        policyVersion: policy.version,
-        writeMode: featureFlag.writeMode,
-        snapshotRefreshRequired: decision.snapshotRefreshRequired
+        articleId: decision.articleId,
+        articleVersion: decision.articleVersion,
+        finalAggregateVersion: decision.finalAggregateVersion,
+        backendOperation: decision.backendOperation,
+        providerMode: decision.providerMode,
+        policyVersion: decision.policyVersion,
+        writeMode: decision.writeMode,
+        requiredLanguageCodes: decision.requiredLanguageCodes,
+        availableLanguageCodes: decision.availableLanguageCodes,
+        missingLanguageCodes: decision.missingLanguageCodes,
+        snapshotRefreshRequired: decision.snapshotRefreshRequired,
+        shadowOutput
       };
 
-      if (featureFlag.writeMode === "production" && decision.status === "ready_for_production") {
+      if (decision.status === "ready_for_production") {
         await tools.publishProductionSnapshot(command);
         return {
           status: "ok"
@@ -476,6 +522,14 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
       }
 
       await tools.publishShadowComparison(command);
+
+      if (decision.terminal) {
+        return {
+          status: "terminal-failure",
+          reason: decision.reasons[0] ?? "publication-decision-rejected"
+        };
+      }
+
       return {
         status: "ok"
       };
@@ -560,6 +614,29 @@ export function createMinimalPublicationEnvelope(overrides: Partial<WorkerMessag
 export function createMinimalPublicationPayload(
   overrides: Readonly<Record<string, unknown>> = {}
 ): Readonly<Record<string, unknown>> {
+  const publicationRef = {
+    policyVersion: BACKEND_CAPTURED_PUBLICATION_POLICY.version,
+    articleVersion: 1,
+    currentArticleVersion: 1,
+    finalAggregateVersion: 1,
+    originalUrl: "https://example.com/article-001",
+    canonicalIdentityHash: "sha256:article-001-canonical",
+    canonicalIdentityValid: true,
+    enrichmentPolicyValid: true,
+    approvalStatus: "accepted",
+    sourceSummaryPersisted: true,
+    persistedSourceSummaryRef: {
+      kind: "backend-record",
+      uri: "backend://worker-uplift/final/article-001/source-summary",
+      mediaType: "application/json"
+    },
+    processingState: "clear",
+    ...recordOverride(overrides.publicationRef)
+  };
+  const { publicationRef: _ignoredPublicationRef, ...topLevelOverrides } = overrides;
+
+  void _ignoredPublicationRef;
+
   return {
     schemaId: STAGE_PAYLOAD_SCHEMA_IDS.publicationReadiness,
     schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
@@ -587,8 +664,13 @@ export function createMinimalPublicationPayload(
     ],
     missingLanguageCodes: [],
     snapshotRefreshRequired: true,
-    ...overrides
+    publicationRef,
+    ...topLevelOverrides
   };
+}
+
+function recordOverride(value: unknown): Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Readonly<Record<string, unknown>> : {};
 }
 
 export function createMinimalPublicationDelivery(): RuntimeMessageDelivery {

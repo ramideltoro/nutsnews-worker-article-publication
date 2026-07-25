@@ -3,6 +3,7 @@ import os from "node:os";
 export const PUBLICATION_SERVICE_NAME = "nutsnews-worker-article-publication" as const;
 export const PUBLICATION_SERVICE_VERSION = "0.1.0" as const;
 export const PUBLICATION_PRODUCTION_CONFIRMATION = "backend-protected-publication-cutover-approved" as const;
+export const PUBLICATION_DEFAULT_POLICY_ID = "worker-uplift-api-admin-compatibility-contract" as const;
 
 export type PublicationDependencyMode = "test" | "production";
 export type PublicationTelemetryLogMode = "stdout" | "silent";
@@ -29,7 +30,7 @@ export const PUBLICATION_CONFIG_SCHEMA = [
   variable("NUTSNEWS_PUBLICATION_SHADOW_SCHEMA_VERSION", "Expected worker-uplift shadow schema compatibility version.", false, false, "worker-uplift-shadow-v1"),
   variable("NUTSNEWS_PUBLICATION_DATABASE_ROLE", "Dedicated database role used by the publication service.", false, false, "nutsnews_worker_publication"),
   variable("NUTSNEWS_PUBLICATION_BACKEND_API_IDENTITY", "Scoped backend API identity used for publication commands.", false, false, "worker-uplift-publication"),
-  variable("NUTSNEWS_PUBLICATION_POLICY_ID", "Versioned backend-owned readiness policy identifier.", false, false, "backend-publication-policy-v1"),
+  variable("NUTSNEWS_PUBLICATION_POLICY_ID", "Versioned backend-owned readiness policy identifier.", false, false, PUBLICATION_DEFAULT_POLICY_ID),
   variable("NUTSNEWS_PUBLICATION_FEATURE_FLAG", "Backend-owned feature flag that gates publication execution.", false, false, "worker-uplift-publication-shadow"),
   variable("NUTSNEWS_PUBLICATION_WRITE_MODE", "Publication write mode; shadow comparison is the hard default.", false, false, "shadow_comparison"),
   variable("NUTSNEWS_PUBLICATION_PRODUCTION_WRITE_CONFIRMATION", "Protected backend confirmation required for production publication writes.", true, false),
@@ -129,7 +130,7 @@ export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): Pub
       productionWriteConfirmationPresent
     },
     readiness: {
-      policyId: nonEmpty(env.NUTSNEWS_PUBLICATION_POLICY_ID, "backend-publication-policy-v1"),
+      policyId: nonEmpty(env.NUTSNEWS_PUBLICATION_POLICY_ID, PUBLICATION_DEFAULT_POLICY_ID),
       featureFlag: nonEmpty(env.NUTSNEWS_PUBLICATION_FEATURE_FLAG, "worker-uplift-publication-shadow")
     },
     writeMode,
