@@ -4,8 +4,8 @@
 | --- | --- |
 | Repository | `ramideltoro/nutsnews-worker-article-publication` |
 | Owner | `@ramideltoro` |
-| Responsibility | Own explicit production publication after readiness approval, keeping production writes behind backend-owned deployment controls and rollback criteria. |
-| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-article-publication` after implementation work adds a Dockerfile. |
+| Responsibility | Consume publication-readiness jobs, own guarded publication readiness execution, and keep live visibility behind backend-owned deployment controls and rollback criteria. |
+| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-article-publication`. |
 | Primary artifact | Signed GHCR image tagged only by commit SHA |
 | Support boundary | Repo-local code, tests, CI, package/image publishing, and service-local run notes. |
 | Outside boundary | Backend host runtime/deployments, Grafana Cloud resources, explanatory architecture/operations docs, production secrets, legacy ingestion. |
@@ -25,14 +25,14 @@
 - CODEOWNERS assigns repository ownership to `@ramideltoro`.
 - Default Actions token permission: read-only.
 - Publish workflows request package write permission only inside publish jobs.
-- CI validates repo boundary docs on every push and pull request.
-- CodeQL and dependency review workflows are present for future code-bearing changes.
+- CI installs exact worker contracts/runtime dependencies, validates the service package, and builds the non-root container on every push and pull request.
+- CodeQL and dependency review workflows validate code-bearing changes.
 - Dependabot checks GitHub Actions and npm manifests.
 - Branch protection requires pull requests, resolved conversations, and the `validate` status check where GitHub permits repository branch protection. CODEOWNERS documents ownership for reviews.
 
 ## Conditional Controls
 
-Some GitHub package access controls can be applied only after the first package or container image exists. Until then, this repository documents the intended access model and publish workflows:
+Some GitHub package access controls can be applied only after the first package or container image exists. This repository documents the intended access model and publish workflows:
 
 - Package repos publish exact versions to GitHub Packages. Downstream repos install through `GITHUB_TOKEN` with `packages: read`.
 - Service repos publish signed, immutable SHA-tagged images to GHCR. Backend production deploys pull through `ramideltoro/nutsnews-backend/.github/workflows/protected-backend-ansible-apply.yml` only.
