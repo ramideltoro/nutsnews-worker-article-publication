@@ -10,6 +10,11 @@ import type {
 
 import type { PublicationWriteMode } from "./config.js";
 
+export type PublicationBackendOperation =
+  | "shadow-publication-comparison"
+  | "uplift-publish-articles-batch"
+  | "uplift-refresh-public-feed-snapshot";
+
 export interface PublicationDependencyProbe {
   readonly status: "ok" | "degraded" | "unhealthy";
   readonly summary: string;
@@ -74,7 +79,7 @@ export interface PublicationReadinessDecision {
   readonly missingLanguageCodes: readonly string[];
   readonly snapshotRefreshRequired: boolean;
   readonly writeMode: PublicationWriteMode;
-  readonly backendOperation: "shadow-publication-comparison" | "uplift-publish-articles-batch";
+  readonly backendOperation: Extract<PublicationBackendOperation, "shadow-publication-comparison" | "uplift-publish-articles-batch">;
   readonly providerMode: "backend_postgres_shadow" | "backend_postgres_primary";
   readonly featureFlag: string;
 }
@@ -149,6 +154,87 @@ export interface PublicationShadowOutput {
   readonly availableLanguageCodes: readonly string[];
   readonly missingLanguageCodes: readonly string[];
   readonly snapshotRefreshRequired: boolean;
+  readonly publicFeedSnapshot: PublicFeedSnapshotCompatibilityResult;
+}
+
+export interface PublicFeedSnapshotStableRow {
+  readonly identityHash: string;
+  readonly rank: number;
+  readonly category: string;
+  readonly publishedAt: string;
+  readonly publishedOnSiteAt: string;
+  readonly languageCode: string;
+  readonly requestedLanguageCode: string;
+  readonly translationAvailable: boolean;
+  readonly shape: {
+    readonly idPresent: boolean;
+    readonly sourcePresent: boolean;
+    readonly titlePresent: boolean;
+    readonly imagePresent: boolean;
+    readonly summaryPresent: boolean;
+    readonly categoryPresent: boolean;
+    readonly positivityScorePresent: boolean;
+    readonly publishedAtPresent: boolean;
+    readonly publishedOnSiteAtPresent: boolean;
+  };
+}
+
+export interface PublicFeedSnapshotCompatibilityResult {
+  readonly contractId: "worker-uplift-api-admin-compatibility-contract";
+  readonly contractVersion: 1;
+  readonly capturedAt: string;
+  readonly readModel: "public.public_feed_snapshot";
+  readonly readOperation: "load-public-feed-snapshot-rows";
+  readonly publicReadOperations: readonly [
+    "load-public-feed-snapshot",
+    "load-home-feed-snapshot",
+    "load-public-feed-snapshot-rows"
+  ];
+  readonly productionRefreshOperation: "uplift-refresh-public-feed-snapshot";
+  readonly backendRefreshFunction: "public.refresh_public_feed_snapshot()";
+  readonly status: "compatible" | "mismatch" | "blocked";
+  readonly reasons: readonly string[];
+  readonly directLiveRefreshRequested: false;
+  readonly cloudflareKvMutationRequested: false;
+  readonly requestedLanguageCode: string;
+  readonly normalizedLanguageCode: string;
+  readonly pagination: {
+    readonly limit: number;
+    readonly offset: number;
+    readonly category: string;
+  };
+  readonly orderBy: "snapshot_rank asc";
+  readonly candidateIdentityHashes: readonly string[];
+  readonly backendIdentityHashes: readonly string[];
+  readonly rows: readonly PublicFeedSnapshotStableRow[];
+  readonly legacyKvFallback: {
+    readonly status: "not_configured" | "unchanged" | "mismatch";
+    readonly identityHashes: readonly string[];
+  };
+  readonly cacheMetadata: {
+    readonly legacyKvFallbackObserved: boolean;
+    readonly publicReadersRemainBackendContract: boolean;
+    readonly cacheHeadersPreserved: boolean;
+  };
+  readonly recovery: {
+    readonly retryable: boolean;
+    readonly rollbackAvailable: boolean;
+    readonly staleVersionGuarded: boolean;
+    readonly partialRefreshFailureObservable: boolean;
+  };
+}
+
+export interface PublicationBackendCommandMetadata {
+  readonly idempotencyKey: string;
+  readonly messageId: string;
+  readonly correlationId: string;
+  readonly pipelineRunId: string;
+  readonly stageExecutionId: string;
+  readonly sourceMessageId: string;
+  readonly actorService: "nutsnews-worker-article-publication";
+  readonly schemaVersion: number;
+  readonly operationVersion: string;
+  readonly expectedArticleVersion: number;
 }
 
 export interface PublicationSnapshotCommand {
@@ -157,6 +243,8 @@ export interface PublicationSnapshotCommand {
   readonly articleVersion: number;
   readonly finalAggregateVersion: number;
   readonly backendOperation: PublicationReadinessDecision["backendOperation"];
+  readonly backendOperations: readonly PublicationBackendOperation[];
+  readonly snapshotRefreshOperation: Extract<PublicationBackendOperation, "uplift-refresh-public-feed-snapshot"> | undefined;
   readonly providerMode: PublicationReadinessDecision["providerMode"];
   readonly policyVersion: string;
   readonly writeMode: PublicationWriteMode;
@@ -165,6 +253,8 @@ export interface PublicationSnapshotCommand {
   readonly missingLanguageCodes: readonly string[];
   readonly snapshotRefreshRequired: boolean;
   readonly shadowOutput: PublicationShadowOutput;
+  readonly publicFeedSnapshot: PublicFeedSnapshotCompatibilityResult;
+  readonly backendMetadata: PublicationBackendCommandMetadata;
 }
 
 export interface PublicationSnapshotReceipt {
@@ -172,6 +262,9 @@ export interface PublicationSnapshotReceipt {
   readonly mode: PublicationWriteMode;
   readonly accepted: boolean;
   readonly publishedAt: string;
+  readonly backendOperations: readonly PublicationBackendOperation[];
+  readonly snapshotRefreshRequested: boolean;
+  readonly rollbackAvailable: boolean;
 }
 
 export interface PublicationSnapshotPublisher {
