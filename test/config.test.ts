@@ -32,6 +32,9 @@ describe("loadPublicationConfig", () => {
         backendApiIdentity: "worker-uplift-publication",
         productionWriteConfirmationPresent: false
       },
+      readiness: {
+        policyId: "worker-uplift-api-admin-compatibility-contract"
+      },
       dependencies: {
         databaseConfigured: false,
         rabbitmqConfigured: false,

@@ -34,4 +34,42 @@ describe("publication write safety", () => {
 
     await service.stop();
   });
+
+  it("uses only the scoped backend publication command when all production gates are enabled", async () => {
+    const config = createProductionCapableLocalPublicationConfig();
+    const dependencies = createLocalPublicationDependencies(config);
+    const publisher = dependencies.snapshotPublisher as LocalPublicationSnapshotPublisher;
+    const service = createPublicationService({
+      config,
+      dependencies
+    });
+
+    publisher.productionWritesEnabled = true;
+    publisher.singleWriterEnabled = true;
+    publisher.cutoverState = "cutover-approved";
+
+    await service.start();
+
+    await expect(service.processDelivery(createMinimalPublicationDelivery())).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    expect(publisher.productionPublishes).toHaveLength(1);
+    expect(publisher.productionPublishes[0]).toMatchObject({
+      backendOperation: "uplift-publish-articles-batch",
+      providerMode: "backend_postgres_primary",
+      writeMode: "production",
+      requiredLanguageCodes: [
+        "fr",
+        "ja",
+        "de-CH",
+        "de",
+        "el"
+      ]
+    });
+    expect(publisher.shadowComparisons).toHaveLength(0);
+
+    await service.stop();
+  });
 });

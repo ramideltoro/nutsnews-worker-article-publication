@@ -48,19 +48,40 @@ export interface PublicationDatabase {
 export interface PublicationReadinessPolicySnapshot {
   readonly policyId: string;
   readonly version: string;
+  readonly capturedAt: string;
   readonly source: "backend-worker-api";
   readonly writeMode: PublicationWriteMode;
+  readonly requiredLanguageCodes: readonly string[];
+  readonly holdForTranslations: boolean;
+  readonly minimumLanguageCodes: readonly string[];
+  readonly backlogTreatment: "block_until_recovered" | "allow_non_blocking";
+  readonly timeoutTreatment: "block" | "allow_after_timeout";
+  readonly stale: boolean;
+  readonly scopedPublicationOperation: "uplift-publish-articles-batch";
   readonly requiredChecks: readonly string[];
 }
 
 export interface PublicationReadinessDecision {
-  readonly status: "shadow_compare_only" | "ready_for_production" | "blocked";
+  readonly status: "shadow_compare_only" | "ready_for_production" | "blocked" | "rejected";
+  readonly terminal: boolean;
   readonly reasons: readonly string[];
+  readonly articleId: string;
+  readonly articleVersion: number;
+  readonly finalAggregateVersion: number;
+  readonly policyVersion: string;
+  readonly requiredLanguageCodes: readonly string[];
+  readonly availableLanguageCodes: readonly string[];
+  readonly missingLanguageCodes: readonly string[];
   readonly snapshotRefreshRequired: boolean;
+  readonly writeMode: PublicationWriteMode;
+  readonly backendOperation: "shadow-publication-comparison" | "uplift-publish-articles-batch";
+  readonly providerMode: "backend_postgres_shadow" | "backend_postgres_primary";
+  readonly featureFlag: string;
 }
 
 export interface PublicationReadinessInput {
   readonly articleId: string;
+  readonly envelopeArticleVersion: number;
   readonly payload: Readonly<Record<string, unknown>>;
   readonly policy: PublicationReadinessPolicySnapshot;
   readonly featureFlag: PublicationFeatureFlagSnapshot;
@@ -88,12 +109,15 @@ export interface PublicationFeatureFlag {
 export interface PublicationReadinessEvaluationRecord {
   readonly evaluationId: string;
   readonly articleId: string;
+  readonly articleVersion: number;
+  readonly finalAggregateVersion: number;
   readonly messageId: string;
   readonly idempotencyKey: string;
   readonly policy: PublicationReadinessPolicySnapshot;
   readonly decision: PublicationReadinessDecision;
   readonly writeMode: PublicationWriteMode;
   readonly evaluatedAt: string;
+  readonly shadowOutput: PublicationShadowOutput;
 }
 
 export type PublicationReadinessEvaluationWriteResult =
@@ -108,14 +132,39 @@ export type PublicationReadinessEvaluationWriteResult =
   | {
       readonly status: "conflict";
       readonly reason: string;
+    }
+  | {
+      readonly status: "stale";
+      readonly reason: string;
     };
+
+export interface PublicationShadowOutput {
+  readonly articleId: string;
+  readonly articleVersion: number;
+  readonly finalAggregateVersion: number;
+  readonly policyVersion: string;
+  readonly status: PublicationReadinessDecision["status"];
+  readonly reasons: readonly string[];
+  readonly requiredLanguageCodes: readonly string[];
+  readonly availableLanguageCodes: readonly string[];
+  readonly missingLanguageCodes: readonly string[];
+  readonly snapshotRefreshRequired: boolean;
+}
 
 export interface PublicationSnapshotCommand {
   readonly evaluationId: string;
   readonly articleId: string;
+  readonly articleVersion: number;
+  readonly finalAggregateVersion: number;
+  readonly backendOperation: PublicationReadinessDecision["backendOperation"];
+  readonly providerMode: PublicationReadinessDecision["providerMode"];
   readonly policyVersion: string;
   readonly writeMode: PublicationWriteMode;
+  readonly requiredLanguageCodes: readonly string[];
+  readonly availableLanguageCodes: readonly string[];
+  readonly missingLanguageCodes: readonly string[];
   readonly snapshotRefreshRequired: boolean;
+  readonly shadowOutput: PublicationShadowOutput;
 }
 
 export interface PublicationSnapshotReceipt {
