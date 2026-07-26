@@ -16,6 +16,7 @@ import {
 } from "./config.js";
 import { createPublicationHttpServer } from "./http.js";
 import { createProductionPublicationDependencies } from "./production.js";
+import type { PublicationReconciler } from "./reconciliation.js";
 import { createPublicationService } from "./service.js";
 import { createLocalPublicationDependencies } from "./test-doubles.js";
 
@@ -59,10 +60,19 @@ export {
   type PublicationHttpServer
 } from "./http.js";
 export {
+  PUBLICATION_RECONCILIATION_CONFIRMATION,
+  PUBLICATION_RECONCILIATION_PATH,
+  type PublicationReconciliationCandidate,
+  type PublicationReconciliationReport,
+  type PublicationReconciliationRequest,
+  type PublicationReconciler
+} from "./reconciliation.js";
+export {
   PostgresPublicationBrokerOutbox,
   PostgresPublicationDatabase,
   PostgresPublicationInboxStore,
   PostgresPublicationSnapshotPublisher,
+  PostgresPublicationTerminalReconciler,
   createProductionPublicationDependencies,
   type ProductionPublicationDependencies
 } from "./production.js";
@@ -148,6 +158,12 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
   const httpServer = createPublicationHttpServer({
     config,
     service,
+    ...(hasReconciler(dependencies) ? {
+      reconciler: dependencies.reconciler
+    } : {}),
+    ...(hasReconciliationToken(dependencies) ? {
+      reconciliationToken: dependencies.reconciliationToken
+    } : {}),
     ...(metrics === undefined ? {} : {
       metrics
     })
@@ -195,6 +211,22 @@ function hasClose(value: unknown): value is { close(): Promise<void> } {
     && value !== null
     && "close" in value
     && typeof value.close === "function";
+}
+
+function hasReconciler(value: unknown): value is { readonly reconciler: PublicationReconciler } {
+  return typeof value === "object"
+    && value !== null
+    && "reconciler" in value
+    && typeof value.reconciler === "object"
+    && value.reconciler !== null;
+}
+
+function hasReconciliationToken(value: unknown): value is { readonly reconciliationToken: string } {
+  return typeof value === "object"
+    && value !== null
+    && "reconciliationToken" in value
+    && typeof value.reconciliationToken === "string"
+    && value.reconciliationToken.length > 0;
 }
 
 function combineTelemetrySinks(
