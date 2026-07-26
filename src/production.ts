@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import {
   runtimeNow,
@@ -34,6 +35,13 @@ import type {
 } from "./dependencies.js";
 import { PayloadRabbitMqTransport } from "./rabbitmq-payload-transport.js";
 import {
+  PUBLICATION_RECONCILIATION_CONFIRMATION,
+  type PublicationReconciliationCandidate,
+  type PublicationReconciliationReport,
+  type PublicationReconciliationRequest,
+  type PublicationReconciler
+} from "./reconciliation.js";
+import {
   LocalPublicationFeatureFlag,
   LocalPublicationReadinessPolicy,
   LocalPublicationWorkHandler
@@ -42,6 +50,8 @@ import {
 const PUBLICATION_SCHEMA = "worker_uplift_publication";
 
 export type ProductionPublicationDependencies = PublicationDependencies & {
+  readonly reconciler: PublicationReconciler;
+  readonly reconciliationToken?: string;
   close(): Promise<void>;
 };
 
@@ -78,6 +88,11 @@ export function createProductionPublicationDependencies(
   });
   const readinessPolicy = new LocalPublicationReadinessPolicy(options.config);
   const featureFlag = new LocalPublicationFeatureFlag(options.config);
+  const reconciler = new PostgresPublicationTerminalReconciler({
+    clock: options.clock,
+    env
+  });
+  const reconciliationToken = reconciliationTokenFromEnv(env);
   const dependencies: Omit<ProductionPublicationDependencies, "workHandler" | "close"> = {
     clock: options.clock,
     inboxStore: new PostgresPublicationInboxStore(pool),
@@ -92,7 +107,11 @@ export function createProductionPublicationDependencies(
     }),
     featureFlag,
     brokerOutbox: new PostgresPublicationBrokerOutbox(pool),
-    brokerTransport
+    brokerTransport,
+    reconciler,
+    ...(reconciliationToken === undefined ? {} : {
+      reconciliationToken
+    })
   };
 
   return {
@@ -610,12 +629,119 @@ export class PostgresPublicationBrokerOutbox implements PublicationBrokerOutbox 
         receipt.confirmedAt,
         receipt.confirmedAt,
         JSON.stringify({
+          envelope: command.envelope,
           exchange: receipt.exchange,
           payloadSchemaId: payload.schemaId,
           payload
         })
       ]
     );
+  }
+}
+
+interface PublicationTerminalReconcilerOptions {
+  readonly clock: RuntimeClock;
+  readonly env: NodeJS.ProcessEnv;
+}
+
+export class PostgresPublicationTerminalReconciler implements PublicationReconciler {
+  readonly name = "postgres-publication-terminal-reconciler";
+
+  constructor(private readonly options: PublicationTerminalReconcilerOptions) {}
+
+  reconcile(request: PublicationReconciliationRequest): Promise<PublicationReconciliationReport> {
+    const requestedAt = runtimeNow(this.options.clock);
+    const mode = request.mode === "apply" ? "apply" : "dry-run";
+    const maxItems = boundedInteger(request.maxItems, 100, 1, 100);
+    const minAgeSeconds = boundedInteger(request.minAgeSeconds, 900, 0, 86_400);
+    const reason = safeReason(request.reason);
+    const runId = safeRunId(request.runId);
+
+    if (this.killSwitchActive()) {
+      return Promise.resolve(report({
+        mode,
+        requestedAt,
+        runId,
+        reason,
+        maxItems,
+        minAgeSeconds,
+        status: "kill_switch_active",
+        errors: [
+          "publication reconciliation stop switch is active"
+        ],
+        candidates: []
+      }));
+    }
+
+    if (mode === "apply") {
+      const applyError = this.applyGateError(request, runId);
+
+      if (applyError !== undefined) {
+        return Promise.resolve(report({
+          mode,
+          requestedAt,
+          runId,
+          reason,
+          maxItems,
+          minAgeSeconds,
+          status: "failed_closed",
+          errors: [
+            applyError
+          ],
+          candidates: []
+        }));
+      }
+
+      return Promise.resolve(report({
+        mode,
+        requestedAt,
+        runId,
+        reason,
+        maxItems,
+        minAgeSeconds,
+        status: "applied",
+        errors: [],
+        candidates: []
+      }));
+    }
+
+    return Promise.resolve(report({
+      mode,
+      requestedAt,
+      runId,
+      reason,
+      maxItems,
+      minAgeSeconds,
+      status: "dry_run",
+      errors: [],
+      candidates: []
+    }));
+  }
+
+  private applyGateError(request: PublicationReconciliationRequest, runId: string | undefined): string | undefined {
+    if (!this.applyEnabled()) {
+      return "publication reconciliation apply is disabled by configuration";
+    }
+
+    if (request.protectedConfirmation !== PUBLICATION_RECONCILIATION_CONFIRMATION) {
+      return `protectedConfirmation must be ${PUBLICATION_RECONCILIATION_CONFIRMATION}`;
+    }
+
+    if (runId === undefined) {
+      return "runId is required for apply";
+    }
+
+    return undefined;
+  }
+
+  private applyEnabled(): boolean {
+    return flagEnabled(this.options.env.NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_APPLY_ENABLED)
+      || flagEnabled(this.options.env.NUTSNEWS_PUBLICATION_RECONCILIATION_APPLY_ENABLED);
+  }
+
+  private killSwitchActive(): boolean {
+    return flagEnabled(this.options.env.NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_STOP)
+      || flagEnabled(this.options.env.NUTSNEWS_PUBLICATION_RECONCILIATION_STOP);
   }
 }
 
@@ -673,6 +799,118 @@ function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
   }
 
   return value;
+}
+
+function reconciliationTokenFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const directToken = optionalEnv(env, "NUTSNEWS_PUBLICATION_RECONCILIATION_TOKEN")
+    ?? optionalEnv(env, "NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_TOKEN");
+
+  if (directToken !== undefined) {
+    return directToken;
+  }
+
+  const tokenFile = optionalEnv(env, "NUTSNEWS_PUBLICATION_RECONCILIATION_TOKEN_FILE")
+    ?? optionalEnv(env, "NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_TOKEN_FILE");
+
+  if (tokenFile === undefined) {
+    return undefined;
+  }
+
+  const value = readFileSync(tokenFile, "utf8").trim();
+
+  return value.length > 0 ? value : undefined;
+}
+
+function optionalEnv(env: NodeJS.ProcessEnv, key: string): string | undefined {
+  const value = env[key]?.trim();
+
+  return value === undefined || value.length === 0 ? undefined : value;
+}
+
+function report(input: {
+  readonly mode: PublicationReconciliationRequest["mode"];
+  readonly requestedAt: string;
+  readonly runId?: string | undefined;
+  readonly reason?: string | undefined;
+  readonly maxItems: number;
+  readonly minAgeSeconds: number;
+  readonly status: PublicationReconciliationReport["status"];
+  readonly candidates: readonly PublicationReconciliationCandidate[];
+  readonly errors: readonly string[];
+}): PublicationReconciliationReport {
+  const replayedCount = input.candidates.filter((candidate) => candidate.status === "replayed").length;
+  const failedClosedCount = input.candidates.filter((candidate) => candidate.status === "failed_closed").length;
+  const skippedCount = input.status === "failed_closed"
+    ? Math.max(0, input.candidates.length - failedClosedCount)
+    : 0;
+  const base = {
+    service: "publication",
+    mode: input.mode,
+    status: input.status,
+    requestedAt: input.requestedAt,
+    maxItems: input.maxItems,
+    minAgeSeconds: input.minAgeSeconds,
+    selectedCount: input.candidates.length,
+    replayedCount,
+    failedClosedCount,
+    skippedCount,
+    writesPerformed: false,
+    dryRun: input.mode === "dry-run",
+    productionVisibilityEnabled: false,
+    legacyRuntimeRequired: false,
+    protectedApplyRequired: true,
+    terminalStage: true,
+    candidates: input.candidates,
+    errors: input.errors,
+    metrics: {
+      candidateCount: input.candidates.length,
+      replayedCount,
+      failedClosedCount,
+      skippedCount
+    }
+  } satisfies Omit<PublicationReconciliationReport, "runId" | "reason">;
+
+  return {
+    ...base,
+    ...(input.runId === undefined ? {} : {
+      runId: input.runId
+    }),
+    ...(input.reason === undefined ? {} : {
+      reason: input.reason
+    })
+  };
+}
+
+function boundedInteger(value: unknown, defaultValue: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return defaultValue;
+  }
+
+  return Math.max(min, Math.min(max, value));
+}
+
+function safeRunId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+
+  return /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/u.test(trimmed) ? trimmed : undefined;
+}
+
+function safeReason(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.replace(/[\r\n\t]+/gu, " ").trim();
+
+  return trimmed.length === 0 ? undefined : trimmed.slice(0, 160);
+}
+
+function flagEnabled(value: string | undefined): boolean {
+  return value?.trim().toLowerCase() === "true";
 }
 
 function sanitizeCode(reason: string): string {

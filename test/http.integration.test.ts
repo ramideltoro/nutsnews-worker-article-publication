@@ -13,6 +13,10 @@ import {
   createPublicationHttpServer,
   type PublicationHttpServer
 } from "../src/http.js";
+import type {
+  PublicationReconciliationReport,
+  PublicationReconciler
+} from "../src/reconciliation.js";
 import { createPublicationService } from "../src/service.js";
 import { createLocalPublicationDependencies } from "../src/test-doubles.js";
 
@@ -79,5 +83,80 @@ describe("createPublicationHttpServer", () => {
     expect(JSON.stringify(statusBody)).not.toContain("amqp://");
     expect(JSON.stringify(statusBody)).not.toContain("backend.example.invalid");
     expect(JSON.stringify(statusBody)).not.toContain("secret-not-real");
+  });
+
+  it("protects the reconciliation endpoint with bearer auth", async () => {
+    const config = loadPublicationConfig({
+      NUTSNEWS_PUBLICATION_HTTP_HOST: "127.0.0.1",
+      NUTSNEWS_PUBLICATION_HTTP_PORT: "0",
+      NUTSNEWS_PUBLICATION_TELEMETRY_LOGS: "silent"
+    });
+    service = createPublicationService({
+      config,
+      dependencies: createLocalPublicationDependencies(config)
+    });
+    const reconciler: PublicationReconciler = {
+      name: "test-reconciler",
+      reconcile: (request) => Promise.resolve({
+        service: "publication",
+        mode: request.mode,
+        status: "dry_run",
+        requestedAt: "2026-07-23T00:00:00.000Z",
+        maxItems: 1,
+        minAgeSeconds: 900,
+        selectedCount: 0,
+        replayedCount: 0,
+        failedClosedCount: 0,
+        skippedCount: 0,
+        writesPerformed: false,
+        dryRun: true,
+        productionVisibilityEnabled: false,
+        legacyRuntimeRequired: false,
+        protectedApplyRequired: true,
+        terminalStage: true,
+        candidates: [],
+        errors: [],
+        metrics: {
+          candidateCount: 0,
+          replayedCount: 0,
+          failedClosedCount: 0,
+          skippedCount: 0
+        }
+      } satisfies PublicationReconciliationReport)
+    };
+    server = createPublicationHttpServer({
+      config,
+      service,
+      reconciler,
+      reconciliationToken: "test-token"
+    });
+
+    await service.start();
+    await server.listen();
+
+    const unauthorized = await fetch(server.url("/reconcile/outbox"), {
+      method: "POST",
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const authorized = await fetch(server.url("/reconcile/outbox"), {
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-token"
+      },
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(authorized.status).toBe(200);
+    await expect(authorized.json()).resolves.toMatchObject({
+      status: "dry_run",
+      terminalStage: true,
+      writesPerformed: false,
+      productionVisibilityEnabled: false
+    });
   });
 });
