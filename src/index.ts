@@ -5,6 +5,7 @@ import {
   createJsonRuntimeTelemetrySink,
   createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
+  SYSTEM_RUNTIME_CLOCK,
   getRuntimePackageMetadata,
   type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
@@ -14,6 +15,7 @@ import {
   type PublicationConfig
 } from "./config.js";
 import { createPublicationHttpServer } from "./http.js";
+import { createProductionPublicationDependencies } from "./production.js";
 import { createPublicationService } from "./service.js";
 import { createLocalPublicationDependencies } from "./test-doubles.js";
 
@@ -56,6 +58,17 @@ export {
   createPublicationHttpServer,
   type PublicationHttpServer
 } from "./http.js";
+export {
+  PostgresPublicationBrokerOutbox,
+  PostgresPublicationDatabase,
+  PostgresPublicationInboxStore,
+  PostgresPublicationSnapshotPublisher,
+  createProductionPublicationDependencies,
+  type ProductionPublicationDependencies
+} from "./production.js";
+export {
+  PayloadRabbitMqTransport
+} from "./rabbitmq-payload-transport.js";
 export {
   BACKEND_CAPTURED_PUBLICATION_POLICY,
   evaluatePolicyDrivenPublicationReadiness,
@@ -116,7 +129,12 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createLocalPublicationDependencies(config);
+  const dependencies = config.dependencyMode === "production"
+    ? createProductionPublicationDependencies({
+        config,
+        clock: SYSTEM_RUNTIME_CLOCK
+      })
+    : createLocalPublicationDependencies(config);
   const service = createPublicationService({
     config,
     dependencies,
@@ -141,6 +159,11 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
       },
       async () => {
         await service.stop();
+      },
+      async () => {
+        if (hasClose(dependencies)) {
+          await dependencies.close();
+        }
       }
     ],
     signalSource: process,
@@ -165,6 +188,13 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
       await shutdown.trigger("manual");
     }
   };
+}
+
+function hasClose(value: unknown): value is { close(): Promise<void> } {
+  return typeof value === "object"
+    && value !== null
+    && "close" in value
+    && typeof value.close === "function";
 }
 
 function combineTelemetrySinks(
