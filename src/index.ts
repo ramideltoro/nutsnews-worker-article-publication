@@ -142,7 +142,10 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
   const dependencies = config.dependencyMode === "production"
     ? createProductionPublicationDependencies({
         config,
-        clock: SYSTEM_RUNTIME_CLOCK
+        clock: SYSTEM_RUNTIME_CLOCK,
+        ...(telemetry === undefined ? {} : {
+          telemetry
+        })
       })
     : createLocalPublicationDependencies(config);
   const service = createPublicationService({

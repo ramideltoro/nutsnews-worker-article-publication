@@ -14,7 +14,8 @@ This service establishes the publication runtime, health/status/metrics surface,
 - Provides injectable inbox, readiness policy, database transaction, snapshot publisher, feature flag, broker outbox, broker transport, clock, and work-handler boundaries.
 - Evaluates readiness against the backend-captured publication policy from `worker-uplift-api-admin-compatibility-contract`.
 - Compares shadow public-feed snapshot output against the current backend `public.public_feed_snapshot` contract without creating a second authoritative snapshot schema.
-- Gates readiness on broker lifecycle, dependency probes, database write scope, and publication write-mode status.
+- Gates readiness on an active `publication` main-queue consumer, broker lifecycle, dependency probes, database write scope, and publication write-mode status.
+- Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
 - Exposes `/live`, `/ready`, `/startup`, `/metrics`, `/config-schema`, and `/status`.
 - Keeps `shadow_comparison` as the hard default. Production writes require production dependency mode, configured backend/database/broker/API presence, and the protected confirmation value from backend-owned deployment.
 - Contains no feed fetching, page fetching, AI generation, translation generation, general persistence, direct production snapshot SQL, Cloudflare KV writes, or legacy ingestion logic.
