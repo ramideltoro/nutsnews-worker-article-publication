@@ -9,7 +9,8 @@ import {
   type RuntimeIdempotencyClaimContext,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
-  type RuntimeIdempotencyFailure
+  type RuntimeIdempotencyFailure,
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   Pool,
@@ -58,6 +59,7 @@ export type ProductionPublicationDependencies = PublicationDependencies & {
 interface ProductionPublicationDependencyOptions {
   readonly config: PublicationConfig;
   readonly clock: RuntimeClock;
+  readonly telemetry?: RuntimeTelemetrySink;
   readonly env?: NodeJS.ProcessEnv;
 }
 
@@ -84,7 +86,10 @@ export function createProductionPublicationDependencies(
   const brokerTransport = new PayloadRabbitMqTransport({
     url: requiredEnv(env, "NUTSNEWS_PUBLICATION_RABBITMQ_URL"),
     prefetch: options.config.prefetch,
-    clock: options.clock
+    clock: options.clock,
+    ...(options.telemetry === undefined ? {} : {
+      telemetry: options.telemetry
+    })
   });
   const readinessPolicy = new LocalPublicationReadinessPolicy(options.config);
   const featureFlag = new LocalPublicationFeatureFlag(options.config);

@@ -3,6 +3,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
+  createBrokerConsumerReadinessCheck,
   createRuntimeHealthProbeSet,
   createRuntimeInFlightDrainController,
   createRuntimeMessageProcessor,
@@ -117,6 +118,7 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
         ],
         readinessChecks: [
           brokerReadinessCheck(broker),
+          createBrokerConsumerReadinessCheck(broker, "publication"),
           dependencyReadinessCheck("publication-inbox", options.dependencies.inboxStore),
           dependencyReadinessCheck("publication-database", options.dependencies.database),
           dependencyReadinessCheck("readiness-policy", options.dependencies.readinessPolicy),
