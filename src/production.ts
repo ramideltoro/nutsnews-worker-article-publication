@@ -780,6 +780,7 @@ export class PostgresPublicationSnapshotPublisher implements PublicationSnapshot
         schemaVersion: command.backendMetadata.schemaVersion,
         operationVersion: command.finalAggregateVersion,
         expectedArticleVersion: command.backendMetadata.expectedArticleVersion,
+        ...publicationOperationPayload(operation, command),
         shadowOutput: command.shadowOutput,
         publicFeedSnapshot: command.publicFeedSnapshot
       }),
@@ -790,6 +791,9 @@ export class PostgresPublicationSnapshotPublisher implements PublicationSnapshot
     if (!response.ok) {
       throw new Error(`backend publication operation ${operation} failed with ${String(response.status)}`);
     }
+
+    const receipt = await parseBackendPublicationReceipt(response, operation);
+    assertBackendPublicationReceipt(operation, receipt);
   }
 
   private receipt(command: PublicationSnapshotCommand, refreshCompleted: boolean): PublicationSnapshotReceipt {
@@ -1079,6 +1083,70 @@ function publicationRequestSignal(
         deadline.signal,
         requestTimeout
       ]);
+}
+
+function publicationOperationPayload(
+  operation: PublicationBackendOperation,
+  command: PublicationSnapshotCommand
+): Readonly<Record<string, unknown>> {
+  if (operation === "uplift-publish-articles-batch") {
+    return {
+      originalUrls: [command.originalUrl],
+      status: "published",
+      languageCodes: command.requiredLanguageCodes
+    };
+  }
+
+  if (operation === "uplift-refresh-public-feed-snapshot") {
+    return {};
+  }
+
+  throw new Error("backend publication operation is outside the production scope");
+}
+
+async function parseBackendPublicationReceipt(
+  response: Response,
+  operation: PublicationBackendOperation
+): Promise<Readonly<Record<string, unknown>>> {
+  try {
+    const value: unknown = await response.json();
+
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      return value as Readonly<Record<string, unknown>>;
+    }
+  } catch {
+    // The caller receives a fixed safe error without reflecting a response body.
+  }
+
+  throw new Error(`backend publication operation ${operation} returned an invalid receipt`);
+}
+
+function assertBackendPublicationReceipt(
+  operation: PublicationBackendOperation,
+  receipt: Readonly<Record<string, unknown>>
+): void {
+  if (operation === "uplift-publish-articles-batch") {
+    if (
+      receipt.ok !== true
+      || receipt.requestedCount !== 1
+      || receipt.publishedCount !== 1
+      || receipt.blockedCount !== 0
+      || !Array.isArray(receipt.missingTranslations)
+      || receipt.missingTranslations.length !== 0
+    ) {
+      throw new Error("backend publication operation did not confirm one published article");
+    }
+    return;
+  }
+
+  if (operation === "uplift-refresh-public-feed-snapshot") {
+    if (typeof receipt.refreshedAt !== "string" || receipt.refreshedAt.trim().length === 0) {
+      throw new Error("backend publication refresh did not return a completion timestamp");
+    }
+    return;
+  }
+
+  throw new Error("backend publication receipt is outside the production scope");
 }
 
 function reconciliationTokenFromEnv(env: NodeJS.ProcessEnv): string | undefined {

@@ -164,6 +164,12 @@ function validateHardRequirements(
     reasons.push("missing-article-id");
   }
 
+  if (aggregate.originalUrl === undefined || aggregate.originalUrl.trim().length === 0) {
+    reasons.push("missing-original-url");
+  } else if (!isHttpUrl(aggregate.originalUrl)) {
+    reasons.push("invalid-original-url");
+  }
+
   if (aggregate.articleVersion !== aggregate.currentArticleVersion) {
     reasons.push("non-current-article-version");
   }
@@ -210,6 +216,7 @@ function decision(
     terminal: status === "rejected",
     reasons,
     articleId: aggregate.articleId,
+    originalUrl: aggregate.originalUrl ?? "",
     articleVersion: aggregate.articleVersion,
     finalAggregateVersion: aggregate.finalAggregateVersion,
     policyVersion: policy.version,
@@ -232,6 +239,16 @@ function missingPolicyLanguages(required: readonly string[], available: readonly
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+
+    return (url.protocol === "http:" || url.protocol === "https:") && url.hostname.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function positiveInteger(value: unknown): number | undefined {
