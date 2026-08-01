@@ -640,6 +640,7 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
       const command = {
         evaluationId,
         articleId: decision.articleId,
+        originalUrl: decision.originalUrl,
         articleVersion: decision.articleVersion,
         finalAggregateVersion: decision.finalAggregateVersion,
         backendOperation: decision.backendOperation,

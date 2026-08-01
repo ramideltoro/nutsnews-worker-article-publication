@@ -158,6 +158,42 @@ describe("buildPublicFeedSnapshotCompatibility", () => {
     ]));
     expect(result.recovery.rollbackAvailable).toBe(true);
   });
+
+  it("rejects production readiness when the scoped publish URL is absent", () => {
+    const baseline = createMinimalPublicationPayload();
+    const publicationRef = {
+      ...(baseline.publicationRef as Readonly<Record<string, unknown>>)
+    } as Record<string, unknown>;
+    delete publicationRef.originalUrl;
+    const decision = readinessDecision({
+      ...baseline,
+      publicationRef
+    });
+
+    expect(decision).toMatchObject({
+      status: "rejected",
+      originalUrl: ""
+    });
+    expect(decision.reasons).toContain("missing-original-url");
+  });
+
+  it("rejects synthetic or otherwise non-HTTP publication identities", () => {
+    const baseline = createMinimalPublicationPayload();
+    const publicationRef = {
+      ...(baseline.publicationRef as Readonly<Record<string, unknown>>),
+      originalUrl: "shadow://article/article-001"
+    };
+    const decision = readinessDecision({
+      ...baseline,
+      publicationRef
+    });
+
+    expect(decision).toMatchObject({
+      status: "rejected",
+      originalUrl: "shadow://article/article-001"
+    });
+    expect(decision.reasons).toContain("invalid-original-url");
+  });
 });
 
 function readinessDecision(payload: Readonly<Record<string, unknown>>) {

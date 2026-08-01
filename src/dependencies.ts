@@ -94,6 +94,7 @@ export interface PublicationReadinessDecision {
   readonly terminal: boolean;
   readonly reasons: readonly string[];
   readonly articleId: string;
+  readonly originalUrl: string;
   readonly articleVersion: number;
   readonly finalAggregateVersion: number;
   readonly policyVersion: string;
@@ -263,6 +264,7 @@ export interface PublicationBackendCommandMetadata {
 export interface PublicationSnapshotCommand {
   readonly evaluationId: string;
   readonly articleId: string;
+  readonly originalUrl: string;
   readonly articleVersion: number;
   readonly finalAggregateVersion: number;
   readonly backendOperation: PublicationReadinessDecision["backendOperation"];
