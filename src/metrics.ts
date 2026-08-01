@@ -28,7 +28,8 @@ export const PUBLICATION_STAGE_OUTCOMES = [
   "duplicate",
   "invalid",
   "retry",
-  "dlq"
+  "dlq",
+  "failure"
 ] as const;
 
 export type PublicationStageOutcome = (typeof PUBLICATION_STAGE_OUTCOMES)[number];

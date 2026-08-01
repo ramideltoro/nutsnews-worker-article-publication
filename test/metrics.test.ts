@@ -87,7 +87,8 @@ describe("publication Prometheus telemetry", () => {
     expect(stageEvents).toHaveLength(PUBLICATION_STAGE_OUTCOMES.length);
 
     for (const outcome of PUBLICATION_STAGE_OUTCOMES) {
-      expect(stageEvents).toContain(`nutsnews_worker_uplift_stage_events_total{environment="production",service="publication",outcome="${outcome}"} 1`);
+      const expected = outcome === "failure" ? "0" : "1";
+      expect(stageEvents).toContain(`nutsnews_worker_uplift_stage_events_total{environment="production",service="publication",outcome="${outcome}"} ${expected}`);
     }
 
     expect(output).toContain('nutsnews_worker_expected_active{environment="production",service="publication"} 0');

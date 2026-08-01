@@ -24,7 +24,7 @@ This service establishes the publication runtime, health/status/metrics surface,
 
 The publication service is the terminal-success SLO producer for the worker-uplift pipeline. Its `/metrics` endpoint exports:
 
-- `nutsnews_worker_uplift_stage_events_total{environment,service="publication",outcome}` for the bounded outcomes `success`, `duplicate`, `invalid`, `retry`, and `dlq`;
+- `nutsnews_worker_uplift_stage_events_total{environment,service="publication",outcome}` for the bounded outcomes `success`, `duplicate`, `invalid`, `retry`, `dlq`, and `failure`; all six series are seeded even though publication terminal failures are classified as `dlq`;
 - `nutsnews_worker_uplift_stage_latency_seconds`, a fixed-bucket Prometheus histogram with boundaries `0.01`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, and `300` seconds plus `+Inf`;
 - `nutsnews_worker_expected_active{environment,service="publication"}`, which is `0` in the default shadow-comparison mode and becomes `1` only with the protected production write-mode cutover;
 - distinct `nutsnews_worker_health_probe` liveness, startup, and readiness series, plus the runtime-owned active-consumer signal for the contracted publication queue.
