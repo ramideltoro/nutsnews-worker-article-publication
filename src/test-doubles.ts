@@ -20,6 +20,7 @@ import {
   type RuntimeClock,
   type RuntimeMessageContext,
   type RuntimeIdempotencyClaimContext,
+  type RuntimeIdempotencyClaimReleaseResult,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
@@ -108,6 +109,13 @@ export class InMemoryPublicationInboxStore implements PublicationInboxStore {
 
   markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
     return this.store.markFailed(idempotencyKey, failure);
+  }
+
+  releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    return this.store.releaseClaim(idempotencyKey, failure);
   }
 }
 
@@ -573,9 +581,12 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
   }
 
   async handle(context: Parameters<PublicationWorkHandler["handle"]>[0], tools: PublicationWorkTools): Promise<RuntimeHandlerResult> {
+    tools.assertActive();
     const articleId = typeof context.payload.articleId === "string" ? context.payload.articleId : context.envelope.aggregate.id;
     const policy = await this.dependencies.readinessPolicy.getCurrentPolicy();
+    tools.assertActive();
     const featureFlag = await this.dependencies.featureFlag.resolve();
+    tools.assertActive();
     const decision = await this.dependencies.readinessPolicy.evaluate({
       articleId,
       envelopeArticleVersion: context.envelope.aggregate.version,
@@ -583,6 +594,7 @@ export class LocalPublicationWorkHandler implements PublicationWorkHandler {
       policy,
       featureFlag
     });
+    tools.assertActive();
     const evaluationId = `publication-evaluation:${context.envelope.idempotencyKey}`;
     const publicFeedSnapshot = buildPublicFeedSnapshotCompatibility({
       payload: context.payload,
@@ -757,6 +769,7 @@ export function createLocalPublicationDependencies(config = loadPublicationConfi
 export function createProductionCapableLocalPublicationConfig(): PublicationConfig {
   return loadPublicationConfig({
     NUTSNEWS_PUBLICATION_DEPENDENCY_MODE: "production",
+    NUTSNEWS_PUBLICATION_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
     NUTSNEWS_PUBLICATION_DATABASE_URL: "postgres://example.invalid/publication",
     NUTSNEWS_PUBLICATION_RABBITMQ_URL: "amqp://example.invalid",
     NUTSNEWS_PUBLICATION_BACKEND_API_BASE_URL: "https://backend.example.invalid/worker",

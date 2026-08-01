@@ -19,6 +19,7 @@ export interface PublicationConfigVariable {
 
 export const PUBLICATION_CONFIG_SCHEMA = [
   variable("NUTSNEWS_ENVIRONMENT", "Runtime environment label for logs and metrics.", false, false, "local"),
+  variable("NUTSNEWS_PUBLICATION_BUILD_REVISION", "Immutable lowercase 40-character Git commit revision baked into the production image.", true, false, "development"),
   variable("NUTSNEWS_PUBLICATION_HTTP_HOST", "Health, status, and metrics bind host.", false, false, "0.0.0.0"),
   variable("NUTSNEWS_PUBLICATION_HTTP_PORT", "Health, status, and metrics bind port.", false, false, "8080"),
   variable("NUTSNEWS_PUBLICATION_DEPENDENCY_MODE", "Use test dependencies locally or require production dependency presence.", false, false, "test"),
@@ -45,6 +46,7 @@ export interface PublicationConfig {
   readonly serviceName: typeof PUBLICATION_SERVICE_NAME;
   readonly serviceVersion: typeof PUBLICATION_SERVICE_VERSION;
   readonly environment: string;
+  readonly buildRevision: string;
   readonly host: string;
   readonly http: {
     readonly host: string;
@@ -90,6 +92,7 @@ export class PublicationConfigError extends Error {
 
 export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): PublicationConfig {
   const issues: string[] = [];
+  const environment = nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local");
   const dependencyMode = parseDependencyMode(env.NUTSNEWS_PUBLICATION_DEPENDENCY_MODE, issues);
   const dependencies = {
     databaseConfigured: hasValue(env.NUTSNEWS_PUBLICATION_DATABASE_URL),
@@ -105,6 +108,8 @@ export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): Pub
     requireConfigured("NUTSNEWS_PUBLICATION_BACKEND_API_TOKEN", dependencies.backendApiCredentialConfigured, issues);
   }
 
+  const buildRevision = parseBuildRevision(env.NUTSNEWS_PUBLICATION_BUILD_REVISION, dependencyMode, issues);
+
   const writeMode = parseWriteMode(env.NUTSNEWS_PUBLICATION_WRITE_MODE, issues);
   const productionWriteConfirmationPresent = env.NUTSNEWS_PUBLICATION_PRODUCTION_WRITE_CONFIRMATION === PUBLICATION_PRODUCTION_CONFIRMATION;
   const concurrency = parseInteger(env.NUTSNEWS_PUBLICATION_CONCURRENCY, "NUTSNEWS_PUBLICATION_CONCURRENCY", 1, 1, 8, issues);
@@ -112,7 +117,8 @@ export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): Pub
   const config: PublicationConfig = {
     serviceName: PUBLICATION_SERVICE_NAME,
     serviceVersion: PUBLICATION_SERVICE_VERSION,
-    environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    environment,
+    buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
       host: nonEmpty(env.NUTSNEWS_PUBLICATION_HTTP_HOST, "0.0.0.0"),
@@ -147,6 +153,10 @@ export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): Pub
 
   if (config.writeMode === "production" && config.dependencyMode !== "production") {
     issues.push("NUTSNEWS_PUBLICATION_WRITE_MODE=production requires NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.");
+  }
+
+  if (config.environment.toLowerCase() === "production" && config.dependencyMode !== "production") {
+    issues.push("NUTSNEWS_ENVIRONMENT=production requires NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.");
   }
 
   if (config.writeMode === "production" && !config.security.productionWriteConfirmationPresent) {
@@ -201,6 +211,20 @@ function parseDependencyMode(value: string | undefined, issues: string[]): Publi
 
   issues.push("NUTSNEWS_PUBLICATION_DEPENDENCY_MODE must be test or production.");
   return "test";
+}
+
+function parseBuildRevision(
+  value: string | undefined,
+  dependencyMode: PublicationDependencyMode,
+  issues: string[]
+): string {
+  const revision = nonEmpty(value, "development");
+
+  if (dependencyMode === "production" && !/^[0-9a-f]{40}$/u.test(revision)) {
+    issues.push("NUTSNEWS_PUBLICATION_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.");
+  }
+
+  return revision;
 }
 
 function parseTelemetryLogMode(value: string | undefined, issues: string[]): PublicationTelemetryLogMode {

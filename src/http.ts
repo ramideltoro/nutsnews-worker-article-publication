@@ -2,10 +2,7 @@ import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
-import {
-  runtimeHealthEndpointResponse,
-  type PrometheusRuntimeTelemetrySink
-} from "@ramideltoro/nutsnews-worker-runtime";
+import { runtimeHealthEndpointResponse } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
   PUBLICATION_CONFIG_SCHEMA,
@@ -17,11 +14,12 @@ import {
   type PublicationReconciler
 } from "./reconciliation.js";
 import type { PublicationService } from "./service.js";
+import type { PublicationMetricsSink } from "./metrics.js";
 
 export interface PublicationHttpServerOptions {
   readonly config: PublicationConfig;
   readonly service: PublicationService;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: PublicationMetricsSink;
   readonly reconciler?: PublicationReconciler;
   readonly reconciliationToken?: string;
 }
