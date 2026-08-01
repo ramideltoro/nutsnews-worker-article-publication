@@ -1,14 +1,12 @@
 import {
-  createBufferedRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink
-} from "@ramideltoro/nutsnews-worker-runtime";
-import {
   describe,
   expect,
   it
 } from "vitest";
 
 import { loadPublicationConfig } from "../src/config.js";
+import { createPublicationPrometheusTelemetrySink } from "../src/metrics.js";
+import { PublicationOperationDeadlineError } from "../src/operation-deadline.js";
 import { createPublicationService } from "../src/service.js";
 import {
   LocalPublicationBrokerTransport,
@@ -376,6 +374,57 @@ describe("createPublicationService", () => {
 
     await context.service.stop();
   });
+
+  it("blocks an external database side effect after the monotonic handler deadline", async () => {
+    const config = loadPublicationConfig({
+      NUTSNEWS_PUBLICATION_HTTP_PORT: "0",
+      NUTSNEWS_PUBLICATION_TELEMETRY_LOGS: "silent"
+    });
+    const localDependencies = createLocalPublicationDependencies(config);
+    const database = localDependencies.database as LocalPublicationDatabase;
+    const controller = new AbortController();
+    let active = true;
+    let disposed = false;
+    const service = createPublicationService({
+      config,
+      dependencies: {
+        ...localDependencies,
+        workHandler: {
+          name: "deadline-expiry-test-handler",
+          async handle(_context, tools) {
+            active = false;
+            controller.abort(new PublicationOperationDeadlineError());
+            return tools.withTransaction(() => Promise.resolve({
+              status: "ok"
+            }));
+          }
+        }
+      },
+      operationDeadlineFactory: () => ({
+        signal: controller.signal,
+        assertActive(): void {
+          if (!active) {
+            throw new PublicationOperationDeadlineError();
+          }
+        },
+        dispose(): void {
+          disposed = true;
+        }
+      })
+    });
+
+    await expect(service.processDelivery(createMinimalPublicationDelivery())).resolves.toMatchObject({
+      action: "retry",
+      reason: "idempotency-failure-record-error"
+    });
+    await expect(service.processDelivery(createMinimalPublicationDelivery())).resolves.toMatchObject({
+      action: "retry",
+      reason: "idempotency-in-progress"
+    });
+    expect(database.transactions).toHaveLength(0);
+    expect(disposed).toBe(true);
+  });
+
   it("reports readiness unhealthy when the main queue consumer is cancelled", async () => {
     const context = createServiceContext();
 
@@ -390,6 +439,10 @@ describe("createPublicationService", () => {
       queue: "nutsnews.worker.publication.v1",
       activeConsumers: 0
     });
+    const metrics = context.metrics.collect();
+    expect(metrics).toContain('nutsnews_worker_health_probe{environment="local",host="');
+    expect(metrics).toContain('outcome="unhealthy",probe="readiness"} 1');
+    expect(metrics).toContain('outcome="unhealthy",probe="readiness",check="rabbitmq-consumer"} 1');
 
     await context.service.stop();
   });
@@ -401,19 +454,19 @@ function createServiceContext() {
     NUTSNEWS_PUBLICATION_TELEMETRY_LOGS: "silent"
   });
   const dependencies = createLocalPublicationDependencies(config);
-  const telemetry = createBufferedRuntimeTelemetrySink();
-  const metrics = createPrometheusRuntimeTelemetrySink({
+  const metrics = createPublicationPrometheusTelemetrySink({
     identity: {
       service: config.serviceName,
       version: config.serviceVersion,
       environment: config.environment,
       host: config.host
-    }
+    },
+    expectedActive: false
   });
   const service = createPublicationService({
     config,
     dependencies,
-    telemetry,
+    telemetry: metrics,
     metrics
   });
 
@@ -422,6 +475,7 @@ function createServiceContext() {
     database: dependencies.database as LocalPublicationDatabase,
     policy: dependencies.readinessPolicy as LocalPublicationReadinessPolicy,
     publisher: dependencies.snapshotPublisher as LocalPublicationSnapshotPublisher,
+    metrics,
     service
   };
 }

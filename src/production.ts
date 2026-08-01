@@ -7,6 +7,7 @@ import {
   type BrokerPublishReceipt,
   type RuntimeClock,
   type RuntimeIdempotencyClaimContext,
+  type RuntimeIdempotencyClaimReleaseResult,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
@@ -47,8 +48,30 @@ import {
   LocalPublicationReadinessPolicy,
   LocalPublicationWorkHandler
 } from "./test-doubles.js";
+import {
+  PUBLICATION_BACKEND_HEALTH_TIMEOUT_MS,
+  PUBLICATION_BACKEND_REQUEST_TIMEOUT_MS,
+  PUBLICATION_DATABASE_CONNECTION_TIMEOUT_MS,
+  PUBLICATION_DATABASE_IDLE_TRANSACTION_TIMEOUT_MS,
+  PUBLICATION_DATABASE_LOCK_TIMEOUT_MS,
+  PUBLICATION_DATABASE_QUERY_TIMEOUT_MS,
+  PUBLICATION_DATABASE_STATEMENT_TIMEOUT_MS,
+  PUBLICATION_INBOX_CLAIM_LEASE_MS,
+  assertPublicationOperationActive,
+  type PublicationOperationDeadline
+} from "./operation-deadline.js";
 
 const PUBLICATION_SCHEMA = "worker_uplift_publication";
+const PUBLICATION_DATABASE_RESERVED_URL_PARAMETERS = new Set([
+  "application_name",
+  "connect_timeout",
+  "connectiontimeoutmillis",
+  "idle_in_transaction_session_timeout",
+  "lock_timeout",
+  "options",
+  "query_timeout",
+  "statement_timeout"
+]);
 
 export type ProductionPublicationDependencies = PublicationDependencies & {
   readonly reconciler: PublicationReconciler;
@@ -78,10 +101,17 @@ export function createProductionPublicationDependencies(
   options: ProductionPublicationDependencyOptions
 ): ProductionPublicationDependencies {
   const env = options.env ?? process.env;
+  const databaseUrl = safePublicationDatabaseUrl(requiredEnv(env, "NUTSNEWS_PUBLICATION_DATABASE_URL"));
   const pool = new Pool({
-    connectionString: requiredEnv(env, "NUTSNEWS_PUBLICATION_DATABASE_URL"),
+    connectionString: databaseUrl,
     max: Math.max(2, options.config.concurrency + 1),
-    application_name: options.config.serviceName
+    application_name: options.config.serviceName,
+    connectionTimeoutMillis: PUBLICATION_DATABASE_CONNECTION_TIMEOUT_MS,
+    query_timeout: PUBLICATION_DATABASE_QUERY_TIMEOUT_MS,
+    statement_timeout: PUBLICATION_DATABASE_STATEMENT_TIMEOUT_MS,
+    lock_timeout: PUBLICATION_DATABASE_LOCK_TIMEOUT_MS,
+    idle_in_transaction_session_timeout: PUBLICATION_DATABASE_IDLE_TRANSACTION_TIMEOUT_MS,
+    options: publicationDatabaseStartupOptions()
   });
   const brokerTransport = new PayloadRabbitMqTransport({
     url: requiredEnv(env, "NUTSNEWS_PUBLICATION_RABBITMQ_URL"),
@@ -142,12 +172,21 @@ export class PostgresPublicationInboxStore implements PublicationInboxStore {
     idempotencyKey: string,
     context: RuntimeIdempotencyClaimContext
   ): Promise<RuntimeIdempotencyClaimResult> {
+    const claimToken = randomUUID();
     const inserted = await this.pool.query<{ readonly received_at: Date }>(
       `INSERT INTO ${PUBLICATION_SCHEMA}.inbox (
         message_id, pipeline_run_id, stage_execution_id, source_stage, source_message_id,
         entity_kind, entity_id, schema_version, operation_version, idempotency_key,
         payload_ref, payload_digest, received_at, status, diagnostic_metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing', $14::jsonb)
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing',
+        $14::jsonb || jsonb_build_object(
+          'claimToken', $15::text,
+          'claimMessageId', $1::text,
+          'claimExpiresAt', to_jsonb(statement_timestamp() + interval '${String(PUBLICATION_INBOX_CLAIM_LEASE_MS / 1_000)} seconds'),
+          'claimExpiresAtEpochMs', floor(extract(epoch FROM statement_timestamp() + interval '${String(PUBLICATION_INBOX_CLAIM_LEASE_MS / 1_000)} seconds') * 1000)::bigint
+        )
+      )
       ON CONFLICT (idempotency_key) DO NOTHING
       RETURNING received_at`,
       [
@@ -167,15 +206,78 @@ export class PostgresPublicationInboxStore implements PublicationInboxStore {
         JSON.stringify({
           route: context.envelope.route,
           attempt: context.envelope.attempt
-        })
+        }),
+        claimToken
       ]
     );
 
     if ((inserted.rowCount ?? 0) > 0) {
       return {
         status: "claimed",
-        firstSeenAt: context.receivedAt,
-        replay: false
+        firstSeenAt: inserted.rows[0]?.received_at.toISOString() ?? context.receivedAt,
+        replay: false,
+        claimToken
+      };
+    }
+
+    await this.pool.query(
+      `UPDATE ${PUBLICATION_SCHEMA}.inbox
+       SET diagnostic_metadata = diagnostic_metadata || jsonb_build_object(
+         'legacyClaimObservedAt', to_jsonb(statement_timestamp()),
+         'claimExpiresAt', to_jsonb(statement_timestamp() + interval '${String(PUBLICATION_INBOX_CLAIM_LEASE_MS / 1_000)} seconds'),
+         'claimExpiresAtEpochMs', floor(extract(epoch FROM statement_timestamp() + interval '${String(PUBLICATION_INBOX_CLAIM_LEASE_MS / 1_000)} seconds') * 1000)::bigint
+       )
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND jsonb_typeof(diagnostic_metadata->'claimExpiresAtEpochMs') IS DISTINCT FROM 'number'`,
+      [idempotencyKey]
+    );
+
+    const reclaimed = await this.pool.query<{ readonly received_at: Date }>(
+      `UPDATE ${PUBLICATION_SCHEMA}.inbox
+       SET status = 'processing',
+           sanitized_error_code = NULL,
+           sanitized_error_message = NULL,
+           diagnostic_metadata = (
+             diagnostic_metadata
+             - 'claimToken'
+             - 'claimExpiresAt'
+             - 'claimExpiresAtEpochMs'
+             - 'claimMessageId'
+           ) || $2::jsonb || jsonb_build_object(
+             'claimToken', $3::text,
+             'claimMessageId', $4::text,
+             'claimExpiresAt', to_jsonb(statement_timestamp() + interval '${String(PUBLICATION_INBOX_CLAIM_LEASE_MS / 1_000)} seconds'),
+             'claimExpiresAtEpochMs', floor(extract(epoch FROM statement_timestamp() + interval '${String(PUBLICATION_INBOX_CLAIM_LEASE_MS / 1_000)} seconds') * 1000)::bigint
+           )
+       WHERE idempotency_key = $1
+         AND (
+           status IN ('failed', 'parked')
+           OR (
+             status = 'processing'
+             AND jsonb_typeof(diagnostic_metadata->'claimExpiresAtEpochMs') = 'number'
+             AND (diagnostic_metadata->>'claimExpiresAtEpochMs')::numeric
+               <= floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint
+           )
+         )
+       RETURNING received_at`,
+      [
+        idempotencyKey,
+        JSON.stringify({
+          replayedAt: context.receivedAt,
+          replayMessageId: context.envelope.messageId
+        }),
+        claimToken,
+        context.envelope.messageId
+      ]
+    );
+
+    if ((reclaimed.rowCount ?? 0) > 0) {
+      return {
+        status: "claimed",
+        firstSeenAt: reclaimed.rows[0]?.received_at.toISOString() ?? context.receivedAt,
+        replay: true,
+        claimToken
       };
     }
 
@@ -208,62 +310,74 @@ export class PostgresPublicationInboxStore implements PublicationInboxStore {
       };
     }
 
-    if (row.status === "failed" || row.status === "parked") {
-      await this.pool.query(
-        `UPDATE ${PUBLICATION_SCHEMA}.inbox
-         SET status = 'processing',
-             sanitized_error_code = NULL,
-             sanitized_error_message = NULL,
-             diagnostic_metadata = diagnostic_metadata || $2::jsonb
-         WHERE idempotency_key = $1`,
-        [
-          idempotencyKey,
-          JSON.stringify({
-            replayedAt: context.receivedAt,
-            replayMessageId: context.envelope.messageId
-          })
-        ]
-      );
-
-      return {
-        status: "claimed",
-        firstSeenAt,
-        replay: true
-      };
-    }
-
     return {
       status: "in-progress",
       firstSeenAt
     };
   }
 
-  async markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    await this.pool.query(
+  async markCompleted(
+    idempotencyKey: string,
+    completion: RuntimeIdempotencyCompletion,
+    deadline?: PublicationOperationDeadline
+  ): Promise<void> {
+    assertPublicationOperationActive(deadline);
+    const result = await this.pool.query(
       `UPDATE ${PUBLICATION_SCHEMA}.inbox
        SET status = 'processed',
            processed_at = $2::timestamptz,
-           diagnostic_metadata = diagnostic_metadata || $3::jsonb
-       WHERE idempotency_key = $1`,
+           diagnostic_metadata = (
+             diagnostic_metadata
+             - 'claimToken'
+             - 'claimExpiresAt'
+             - 'claimExpiresAtEpochMs'
+             - 'claimMessageId'
+           ) || $3::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'claimToken' = $4
+         AND jsonb_typeof(diagnostic_metadata->'claimExpiresAtEpochMs') = 'number'
+         AND (diagnostic_metadata->>'claimExpiresAtEpochMs')::numeric
+           > floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint`,
       [
         idempotencyKey,
         completion.completedAt,
         JSON.stringify({
           completedMessageId: completion.messageId,
           completedStage: completion.stage
-        })
+        }),
+        completion.claimToken
       ]
     );
+    assertPublicationOperationActive(deadline);
+
+    requireOwnedPublicationInboxClaim(result.rowCount, "complete");
   }
 
-  async markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    await this.pool.query(
+  async markFailed(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure,
+    deadline?: PublicationOperationDeadline
+  ): Promise<void> {
+    assertPublicationOperationActive(deadline);
+    const result = await this.pool.query(
       `UPDATE ${PUBLICATION_SCHEMA}.inbox
        SET status = 'failed',
            sanitized_error_code = $2,
            sanitized_error_message = $3,
-           diagnostic_metadata = diagnostic_metadata || $4::jsonb
-       WHERE idempotency_key = $1`,
+           diagnostic_metadata = (
+             diagnostic_metadata
+             - 'claimToken'
+             - 'claimExpiresAt'
+             - 'claimExpiresAtEpochMs'
+             - 'claimMessageId'
+           ) || $4::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'claimToken' = $5
+         AND jsonb_typeof(diagnostic_metadata->'claimExpiresAtEpochMs') = 'number'
+         AND (diagnostic_metadata->>'claimExpiresAtEpochMs')::numeric
+           > floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint`,
       [
         idempotencyKey,
         sanitizeCode(failure.reason),
@@ -272,9 +386,82 @@ export class PostgresPublicationInboxStore implements PublicationInboxStore {
           failedAt: failure.failedAt,
           failedMessageId: failure.messageId,
           retryable: failure.retryable
-        })
+        }),
+        failure.claimToken
       ]
     );
+    assertPublicationOperationActive(deadline);
+
+    requireOwnedPublicationInboxClaim(result.rowCount, "fail");
+  }
+
+  async releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure,
+    deadline?: PublicationOperationDeadline
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    assertPublicationOperationActive(deadline);
+    const released = await this.pool.query(
+      `UPDATE ${PUBLICATION_SCHEMA}.inbox
+       SET status = 'failed',
+           sanitized_error_code = $2,
+           sanitized_error_message = $3,
+           diagnostic_metadata = (
+             diagnostic_metadata
+             - 'claimToken'
+             - 'claimExpiresAt'
+             - 'claimExpiresAtEpochMs'
+             - 'claimMessageId'
+           ) || $4::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'claimToken' = $5
+         AND jsonb_typeof(diagnostic_metadata->'claimExpiresAtEpochMs') = 'number'
+         AND (diagnostic_metadata->>'claimExpiresAtEpochMs')::numeric
+           > floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint`,
+      [
+        idempotencyKey,
+        sanitizeCode(failure.reason),
+        sanitizeMessage(failure.reason),
+        JSON.stringify({
+          releasedAt: failure.failedAt,
+          releasedMessageId: failure.messageId,
+          retryable: failure.retryable
+        }),
+        failure.claimToken
+      ]
+    );
+    assertPublicationOperationActive(deadline);
+
+    if ((released.rowCount ?? 0) === 1) {
+      return {
+        status: "released"
+      };
+    }
+
+    const existing = await this.pool.query<{ readonly status: string }>(
+      `SELECT status
+       FROM ${PUBLICATION_SCHEMA}.inbox
+       WHERE idempotency_key = $1`,
+      [idempotencyKey]
+    );
+    assertPublicationOperationActive(deadline);
+
+    if (existing.rows[0]?.status === "processed" || existing.rows[0]?.status === "duplicate") {
+      return {
+        status: "preserved-completed"
+      };
+    }
+
+    return {
+      status: "not-owned"
+    };
+  }
+}
+
+function requireOwnedPublicationInboxClaim(rowCount: number | null, operation: string): void {
+  if (rowCount !== 1) {
+    throw new Error(`Cannot ${operation} a publication inbox claim owned by another delivery.`);
   }
 }
 
@@ -318,17 +505,26 @@ export class PostgresPublicationDatabase implements PublicationDatabase {
     };
   }
 
-  async withTransaction<T>(operation: (transaction: PublicationDatabaseTransaction) => Promise<T>): Promise<T> {
+  async withTransaction<T>(
+    operation: (transaction: PublicationDatabaseTransaction) => Promise<T>,
+    deadline?: PublicationOperationDeadline
+  ): Promise<T> {
+    assertPublicationOperationActive(deadline);
     const client = await this.pool.connect();
+    assertPublicationOperationActive(deadline);
     const transaction: PgPublicationTransaction = {
       transactionId: randomUUID(),
       client
     };
 
     try {
+      assertPublicationOperationActive(deadline);
       await client.query("BEGIN");
+      assertPublicationOperationActive(deadline);
       const value = await operation(transaction);
+      assertPublicationOperationActive(deadline);
       await client.query("COMMIT");
+      assertPublicationOperationActive(deadline);
       return value;
     } catch (error: unknown) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -340,9 +536,11 @@ export class PostgresPublicationDatabase implements PublicationDatabase {
 
   async recordReadinessEvaluation(
     transaction: PublicationDatabaseTransaction,
-    record: PublicationReadinessEvaluationRecord
+    record: PublicationReadinessEvaluationRecord,
+    deadline?: PublicationOperationDeadline
   ): Promise<PublicationReadinessEvaluationWriteResult> {
     const client = transactionClient(transaction);
+    assertPublicationOperationActive(deadline);
     const existingByKey = await client.query<PublicationReadinessRow>(
       `SELECT shadow_aggregate_version, diagnostic_metadata
        FROM ${PUBLICATION_SCHEMA}.publication_readiness
@@ -350,6 +548,7 @@ export class PostgresPublicationDatabase implements PublicationDatabase {
        LIMIT 1`,
       [record.idempotencyKey]
     );
+    assertPublicationOperationActive(deadline);
     const existing = existingByKey.rows[0];
     const recordDigest = sha256Json(record.shadowOutput);
 
@@ -375,6 +574,7 @@ export class PostgresPublicationDatabase implements PublicationDatabase {
        WHERE article_identity_hash = $1`,
       [record.articleId]
     );
+    assertPublicationOperationActive(deadline);
     const latestVersion = latest.rows[0]?.latest_version;
 
     if (latestVersion !== null && latestVersion !== undefined && latestVersion > record.finalAggregateVersion) {
@@ -416,6 +616,7 @@ export class PostgresPublicationDatabase implements PublicationDatabase {
         record.evaluatedAt
       ]
     );
+    assertPublicationOperationActive(deadline);
 
     return {
       status: "recorded",
@@ -464,7 +665,7 @@ export class PostgresPublicationSnapshotPublisher implements PublicationSnapshot
     try {
       const response = await this.fetcher(healthUrl(this.baseUrl), {
         method: "GET",
-        signal: AbortSignal.timeout(5_000)
+        signal: AbortSignal.timeout(PUBLICATION_BACKEND_HEALTH_TIMEOUT_MS)
       });
 
       return response.ok
@@ -481,25 +682,37 @@ export class PostgresPublicationSnapshotPublisher implements PublicationSnapshot
     }
   }
 
-  async publishShadowComparison(command: PublicationSnapshotCommand): Promise<PublicationSnapshotReceipt> {
+  async publishShadowComparison(
+    command: PublicationSnapshotCommand,
+    deadline?: PublicationOperationDeadline
+  ): Promise<PublicationSnapshotReceipt> {
+    assertPublicationOperationActive(deadline);
     const receipt = this.receipt(command, false);
 
-    await this.recordDecision(command, receipt, "shadow-publication-comparison");
+    await this.recordDecision(command, receipt, "shadow-publication-comparison", deadline);
+    assertPublicationOperationActive(deadline);
 
     return receipt;
   }
 
-  async publishProductionSnapshot(command: PublicationSnapshotCommand): Promise<PublicationSnapshotReceipt> {
+  async publishProductionSnapshot(
+    command: PublicationSnapshotCommand,
+    deadline?: PublicationOperationDeadline
+  ): Promise<PublicationSnapshotReceipt> {
+    assertPublicationOperationActive(deadline);
     if (this.config.writeMode !== "production" || !this.config.security.productionWriteConfirmationPresent) {
       throw new Error("publication production writes are disabled");
     }
 
     for (const operation of command.backendOperations) {
-      await this.callBackend(operation, command);
+      assertPublicationOperationActive(deadline);
+      await this.callBackend(operation, command, deadline);
+      assertPublicationOperationActive(deadline);
     }
 
     const receipt = this.receipt(command, command.snapshotRefreshRequired);
-    await this.recordDecision(command, receipt, command.backendOperation);
+    await this.recordDecision(command, receipt, command.backendOperation, deadline);
+    assertPublicationOperationActive(deadline);
 
     return receipt;
   }
@@ -507,8 +720,10 @@ export class PostgresPublicationSnapshotPublisher implements PublicationSnapshot
   private async recordDecision(
     command: PublicationSnapshotCommand,
     receipt: PublicationSnapshotReceipt,
-    operation: PublicationBackendOperation
+    operation: PublicationBackendOperation,
+    deadline?: PublicationOperationDeadline
   ): Promise<void> {
+    assertPublicationOperationActive(deadline);
     await this.pool.query(
       `INSERT INTO ${PUBLICATION_SCHEMA}.publication_decisions (
         article_identity_hash, decision_version, decision, reason_code,
@@ -538,9 +753,15 @@ export class PostgresPublicationSnapshotPublisher implements PublicationSnapshot
         receipt.publishedAt
       ]
     );
+    assertPublicationOperationActive(deadline);
   }
 
-  private async callBackend(operation: PublicationBackendOperation, command: PublicationSnapshotCommand): Promise<void> {
+  private async callBackend(
+    operation: PublicationBackendOperation,
+    command: PublicationSnapshotCommand,
+    deadline?: PublicationOperationDeadline
+  ): Promise<void> {
+    assertPublicationOperationActive(deadline);
     const response = await this.fetcher(`${this.baseUrl}/${operation}`, {
       method: "POST",
       headers: {
@@ -562,8 +783,9 @@ export class PostgresPublicationSnapshotPublisher implements PublicationSnapshot
         shadowOutput: command.shadowOutput,
         publicFeedSnapshot: command.publicFeedSnapshot
       }),
-      signal: AbortSignal.timeout(10_000)
+      signal: publicationRequestSignal(deadline, PUBLICATION_BACKEND_REQUEST_TIMEOUT_MS)
     });
+    assertPublicationOperationActive(deadline);
 
     if (!response.ok) {
       throw new Error(`backend publication operation ${operation} failed with ${String(response.status)}`);
@@ -605,7 +827,12 @@ export class PostgresPublicationBrokerOutbox implements PublicationBrokerOutbox 
     return (result.rowCount ?? 0) > 0;
   }
 
-  async record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void> {
+  async record(
+    command: BrokerPublishCommand,
+    receipt: BrokerPublishReceipt,
+    deadline?: PublicationOperationDeadline
+  ): Promise<void> {
+    assertPublicationOperationActive(deadline);
     const payload = command.payload;
 
     await this.pool.query(
@@ -641,6 +868,7 @@ export class PostgresPublicationBrokerOutbox implements PublicationBrokerOutbox 
         })
       ]
     );
+    assertPublicationOperationActive(deadline);
   }
 }
 
@@ -804,6 +1032,53 @@ function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
   }
 
   return value;
+}
+
+function safePublicationDatabaseUrl(value: string): string {
+  let url: URL;
+
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("NUTSNEWS_PUBLICATION_DATABASE_URL must be a valid PostgreSQL URL.");
+  }
+
+  if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+    throw new Error("NUTSNEWS_PUBLICATION_DATABASE_URL must use the postgres or postgresql scheme.");
+  }
+
+  for (const key of url.searchParams.keys()) {
+    const normalized = key.trim().toLowerCase();
+
+    if (PUBLICATION_DATABASE_RESERVED_URL_PARAMETERS.has(normalized)) {
+      throw new Error(`NUTSNEWS_PUBLICATION_DATABASE_URL must not override reserved parameter ${normalized}.`);
+    }
+  }
+
+  return value;
+}
+
+function publicationDatabaseStartupOptions(): string {
+  return [
+    `-c statement_timeout=${String(PUBLICATION_DATABASE_STATEMENT_TIMEOUT_MS)}`,
+    `-c lock_timeout=${String(PUBLICATION_DATABASE_LOCK_TIMEOUT_MS)}`,
+    `-c idle_in_transaction_session_timeout=${String(PUBLICATION_DATABASE_IDLE_TRANSACTION_TIMEOUT_MS)}`
+  ].join(" ");
+}
+
+function publicationRequestSignal(
+  deadline: PublicationOperationDeadline | undefined,
+  timeoutMs: number
+): AbortSignal {
+  assertPublicationOperationActive(deadline);
+  const requestTimeout = AbortSignal.timeout(timeoutMs);
+
+  return deadline === undefined
+    ? requestTimeout
+    : AbortSignal.any([
+        deadline.signal,
+        requestTimeout
+      ]);
 }
 
 function reconciliationTokenFromEnv(env: NodeJS.ProcessEnv): string | undefined {

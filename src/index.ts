@@ -67,10 +67,16 @@ export {
   type PublicationMetricsSink,
   type PublicationPrometheusTelemetrySink,
   type PublicationPrometheusTelemetrySinkOptions,
-  type PublicationHealthOutcome,
-  type PublicationHealthProbe,
   type PublicationStageOutcome
 } from "./metrics.js";
+export {
+  PUBLICATION_CLAIMED_OPERATION_BUDGET,
+  PUBLICATION_HANDLER_DEADLINE_MS,
+  PUBLICATION_INBOX_CLAIM_LEASE_MS,
+  PublicationOperationDeadlineError,
+  createPublicationOperationDeadline,
+  type PublicationOperationDeadline
+} from "./operation-deadline.js";
 export {
   PUBLICATION_RECONCILIATION_CONFIRMATION,
   PUBLICATION_RECONCILIATION_PATH,
@@ -158,9 +164,11 @@ export function createPublicationApplication(
       })
     : undefined;
   const metrics = config.metricsEnabled
-    ? createPublicationPrometheusTelemetrySink({
+      ? createPublicationPrometheusTelemetrySink({
         identity,
-        expectedActive: config.writeMode === "production"
+        expectedActive: config.dependencyMode === "production"
+          && config.writeMode === "production"
+          && config.security.productionWriteConfirmationPresent
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
@@ -323,7 +331,8 @@ function combineTelemetrySinks(
   };
 }
 
-export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";
+export const SUPPORTED_CONTRACTS_PACKAGE_VERSION = "1.0.0";
+export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "1.0.0";
 
 function assertPackageCompatibility(): void {
   const contracts = getContractPackageMetadata();
@@ -331,7 +340,7 @@ function assertPackageCompatibility(): void {
   const contractsVersion: string = contracts.packageVersion;
   const runtimeVersion: string = runtime.packageVersion;
 
-  if (contractsVersion !== "0.4.0") {
+  if (contractsVersion !== SUPPORTED_CONTRACTS_PACKAGE_VERSION) {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 

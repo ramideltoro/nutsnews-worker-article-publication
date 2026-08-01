@@ -92,6 +92,7 @@ export class PublicationConfigError extends Error {
 
 export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): PublicationConfig {
   const issues: string[] = [];
+  const environment = nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local");
   const dependencyMode = parseDependencyMode(env.NUTSNEWS_PUBLICATION_DEPENDENCY_MODE, issues);
   const dependencies = {
     databaseConfigured: hasValue(env.NUTSNEWS_PUBLICATION_DATABASE_URL),
@@ -116,7 +117,7 @@ export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): Pub
   const config: PublicationConfig = {
     serviceName: PUBLICATION_SERVICE_NAME,
     serviceVersion: PUBLICATION_SERVICE_VERSION,
-    environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    environment,
     buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
@@ -152,6 +153,10 @@ export function loadPublicationConfig(env: NodeJS.ProcessEnv = process.env): Pub
 
   if (config.writeMode === "production" && config.dependencyMode !== "production") {
     issues.push("NUTSNEWS_PUBLICATION_WRITE_MODE=production requires NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.");
+  }
+
+  if (config.environment.toLowerCase() === "production" && config.dependencyMode !== "production") {
+    issues.push("NUTSNEWS_ENVIRONMENT=production requires NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.");
   }
 
   if (config.writeMode === "production" && !config.security.productionWriteConfirmationPresent) {

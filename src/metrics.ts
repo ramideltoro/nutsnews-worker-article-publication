@@ -8,7 +8,9 @@ import {
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 export const PUBLICATION_STAGE_LATENCY_BUCKETS_SECONDS = [
+  0.005,
   0.01,
+  0.025,
   0.05,
   0.1,
   0.25,
@@ -33,8 +35,6 @@ export const PUBLICATION_STAGE_OUTCOMES = [
 ] as const;
 
 export type PublicationStageOutcome = (typeof PUBLICATION_STAGE_OUTCOMES)[number];
-export type PublicationHealthProbe = (typeof HEALTH_PROBES)[number];
-export type PublicationHealthOutcome = (typeof HEALTH_OUTCOMES)[number];
 
 export interface PublicationMetricIdentity extends RuntimeServiceIdentity {
   readonly revision?: string;
@@ -54,9 +54,7 @@ export interface PublicationMetricsSink extends RuntimeTelemetrySink {
   setShutdownDraining(draining: boolean): void;
 }
 
-export interface PublicationPrometheusTelemetrySink extends PublicationMetricsSink {
-  setHealthProbe(probe: PublicationHealthProbe, outcome: PublicationHealthOutcome): void;
-}
+export type PublicationPrometheusTelemetrySink = PublicationMetricsSink;
 
 interface HistogramState {
   readonly buckets: number[];
@@ -66,15 +64,19 @@ interface HistogramState {
 
 const PUBLICATION_STAGE_SERVICE = "publication";
 const PUBLICATION_MAIN_QUEUE = "nutsnews.worker.publication.v1";
-const HEALTH_PROBES = [
-  "liveness",
-  "startup",
-  "readiness"
-] as const;
-const HEALTH_OUTCOMES = [
-  "ok",
-  "degraded",
-  "unhealthy"
+const PUBLICATION_HEALTH_CHECKS = [
+  "process",
+  "service-started",
+  "broker-lifecycle",
+  "rabbitmq-consumer",
+  "publication-inbox",
+  "publication-database",
+  "readiness-policy",
+  "snapshot-publisher",
+  "feature-flag",
+  "broker-outbox",
+  "database-write-scope",
+  "publication-write-mode"
 ] as const;
 const MAX_LABEL_LENGTH = 96;
 
@@ -85,7 +87,14 @@ export function createPublicationPrometheusTelemetrySink(
     identity: options.identity,
     ...(options.defaultQueue === undefined ? {} : {
       defaultQueue: options.defaultQueue
-    })
+    }),
+    cardinality: {
+      ...(options.cardinality?.dependencies === undefined ? {} : {
+        dependencies: options.cardinality.dependencies
+      }),
+      healthChecks: options.cardinality?.healthChecks ?? PUBLICATION_HEALTH_CHECKS
+    },
+    expectedActive: options.expectedActive === true
   });
   const environment = metricLabelValue(options.identity.environment);
   const stageCounters = new Map<PublicationStageOutcome, number>();
@@ -94,25 +103,9 @@ export function createPublicationPrometheusTelemetrySink(
     count: 0,
     sum: 0
   };
-  const health = new Map<PublicationHealthProbe, PublicationHealthOutcome>([
-    [
-      "liveness",
-      "ok"
-    ],
-    [
-      "startup",
-      "unhealthy"
-    ],
-    [
-      "readiness",
-      "unhealthy"
-    ]
-  ]);
-
   return {
     allowedLabels: runtime.allowedLabels,
     async emit(event: RuntimeTelemetryEvent): Promise<void> {
-      recordHealthEvent(health, event);
       const outcome = publicationStageOutcome(event);
 
       if (outcome !== undefined) {
@@ -127,8 +120,17 @@ export function createPublicationPrometheusTelemetrySink(
       if (shouldForwardToRuntime(event)) {
         try {
           await runtime.emit(event);
+          await emitRuntimeHealthTransition(runtime, event);
         } catch {
           // The compatibility sink is best effort and cannot alter worker semantics.
+        }
+      }
+
+      if (event.name === "runtime.message.accepted" || event.name === "runtime.message.duplicate") {
+        const timestampMs = Date.parse(event.at);
+
+        if (Number.isFinite(timestampMs)) {
+          runBestEffort(() => runtime.setLastSuccessTimestamp(timestampMs / 1_000));
         }
       }
     },
@@ -137,9 +139,6 @@ export function createPublicationPrometheusTelemetrySink(
 
       return `${[
         runtimeOutput,
-        collectCompatibilityIdentityMetrics(options, runtimeOutput),
-        collectOwnershipMetric(environment, options.expectedActive === true, runtimeOutput),
-        collectHealthProbeMetrics(environment, health),
         collectStageMetrics(environment, stageCounters, histogram)
       ].filter((output) => output.length > 0).join("\n")}\n`;
     },
@@ -148,62 +147,82 @@ export function createPublicationPrometheusTelemetrySink(
     },
     setShutdownDraining(draining): void {
       runBestEffort(() => runtime.setShutdownDraining(draining));
-    },
-    setHealthProbe(probe, outcome): void {
-      health.set(probe, outcome);
     }
   };
 }
 
-function collectCompatibilityIdentityMetrics(
-  options: PublicationPrometheusTelemetrySinkOptions,
-  runtimeOutput: string
-): string {
-  const identity = options.identity;
-  const environment = metricLabelValue(identity.environment);
-  const service = metricLabelValue(identity.service);
-  const lines: string[] = [];
+async function emitRuntimeHealthTransition(
+  runtime: PrometheusRuntimeTelemetrySink,
+  event: RuntimeTelemetryEvent
+): Promise<void> {
+  if (event.name === "runtime.broker.consumer_state_changed") {
+    const active = event.outcome === "active";
 
-  if (!hasMetricFamily(runtimeOutput, "nutsnews_worker_build_info")) {
-    lines.push(
-      "# HELP nutsnews_worker_build_info Immutable worker build identity.",
-      "# TYPE nutsnews_worker_build_info gauge",
-      `nutsnews_worker_build_info${labels({
-        environment,
-        service,
-        version: metricLabelValue(identity.version),
-        revision: metricLabelValue(identity.revision ?? "unknown")
-      })} 1`
-    );
+    await runtime.emit(transitionHealthEvent({
+      at: event.at,
+      probe: "readiness",
+      outcome: active ? "degraded" : "unhealthy",
+      check: "rabbitmq-consumer",
+      checkStatus: active ? "ok" : "unhealthy"
+    }));
+    return;
   }
 
-  if (!hasMetricFamily(runtimeOutput, "nutsnews_worker_deployment_info")) {
-    lines.push(
-      "# HELP nutsnews_worker_deployment_info Worker deployment ownership and dependency adapter identity.",
-      "# TYPE nutsnews_worker_deployment_info gauge",
-      `nutsnews_worker_deployment_info${labels({
-        environment,
-        service,
-        deployment: metricLabelValue(identity.deployment ?? "unknown"),
-        adapter: metricLabelValue(identity.adapter ?? "unknown")
-      })} 1`
-    );
+  if (event.name !== "runtime.broker.state_changed") {
+    return;
   }
 
-  return lines.join("\n");
+  const state = typeof event.attributes?.state === "string" ? event.attributes.state : "unknown";
+  const unavailable = state === "failed" || state === "closing" || state === "closed";
+  const checkStatus = state === "ready" ? "ok" : unavailable ? "unhealthy" : "degraded";
+  const outcome = unavailable ? "unhealthy" : "degraded";
+
+  await runtime.emit(transitionHealthEvent({
+    at: event.at,
+    probe: "startup",
+    outcome,
+    check: "broker-lifecycle",
+    checkStatus
+  }));
+  await runtime.emit(transitionHealthEvent({
+    at: event.at,
+    probe: "readiness",
+    outcome,
+    check: "broker-lifecycle",
+    checkStatus
+  }));
 }
 
-function hasMetricFamily(output: string, metric: string): boolean {
-  return output.split("\n").some((line) => line.startsWith(`# HELP ${metric} `)
-    || line.startsWith(`${metric}{`)
-    || line.startsWith(`${metric} `));
+function transitionHealthEvent(input: {
+  readonly at: string;
+  readonly probe: "startup" | "readiness";
+  readonly outcome: "degraded" | "unhealthy";
+  readonly check: "broker-lifecycle" | "rabbitmq-consumer";
+  readonly checkStatus: "ok" | "degraded" | "unhealthy";
+}): RuntimeTelemetryEvent {
+  return {
+    name: "runtime.health.evaluated",
+    level: input.outcome === "unhealthy" ? "error" : "warn",
+    at: input.at,
+    outcome: input.outcome,
+    attributes: {
+      probe: input.probe,
+      status: input.outcome,
+      checkCount: 1,
+      transitionDerived: true,
+      checks: [
+        {
+          name: input.check,
+          status: input.checkStatus,
+          critical: true,
+          durationMs: 0
+        }
+      ]
+    }
+  };
 }
 
 function shouldForwardToRuntime(event: RuntimeTelemetryEvent): boolean {
-  if (event.name === "runtime.health.evaluated") {
-    return false;
-  }
-
   if (event.name !== "runtime.dependency.observed") {
     return true;
   }
@@ -267,34 +286,6 @@ function publicationStageOutcome(event: RuntimeTelemetryEvent): PublicationStage
   }
 }
 
-function recordHealthEvent(
-  health: Map<PublicationHealthProbe, PublicationHealthOutcome>,
-  event: RuntimeTelemetryEvent
-): void {
-  if (event.name !== "runtime.health.evaluated") {
-    return;
-  }
-
-  const probe = healthProbe(event.attributes?.probe);
-  const outcome = healthOutcome(event.outcome ?? event.attributes?.status);
-
-  if (probe !== undefined && outcome !== undefined) {
-    health.set(probe, outcome);
-  }
-}
-
-function healthProbe(value: unknown): PublicationHealthProbe | undefined {
-  return typeof value === "string" && HEALTH_PROBES.some((probe) => probe === value)
-    ? value as PublicationHealthProbe
-    : undefined;
-}
-
-function healthOutcome(value: unknown): PublicationHealthOutcome | undefined {
-  return typeof value === "string" && HEALTH_OUTCOMES.some((outcome) => outcome === value)
-    ? value as PublicationHealthOutcome
-    : undefined;
-}
-
 function observeHistogram(histogram: HistogramState, durationSeconds: number): void {
   histogram.count += 1;
   histogram.sum += durationSeconds;
@@ -304,58 +295,6 @@ function observeHistogram(histogram: HistogramState, durationSeconds: number): v
       histogram.buckets[index] = (histogram.buckets[index] ?? 0) + 1;
     }
   }
-}
-
-function collectOwnershipMetric(
-  environment: string,
-  expectedActive: boolean,
-  runtimeOutput: string
-): string {
-  if (hasMetricFamily(runtimeOutput, "nutsnews_worker_expected_active")) {
-    return "";
-  }
-
-  return [
-    "# HELP nutsnews_worker_expected_active Whether this worker deployment is expected to own active production work.",
-    "# TYPE nutsnews_worker_expected_active gauge",
-    `nutsnews_worker_expected_active${labels({
-      environment,
-      service: PUBLICATION_STAGE_SERVICE
-    })} ${expectedActive ? "1" : "0"}`
-  ].join("\n");
-}
-
-function collectHealthProbeMetrics(
-  environment: string,
-  health: ReadonlyMap<PublicationHealthProbe, PublicationHealthOutcome>
-): string {
-  if (health.size === 0) {
-    return "";
-  }
-
-  const lines = [
-    "# HELP nutsnews_worker_health_probe Worker liveness, startup, and readiness state by bounded probe and outcome.",
-    "# TYPE nutsnews_worker_health_probe gauge"
-  ];
-
-  for (const probe of HEALTH_PROBES) {
-    const current = health.get(probe);
-
-    if (current === undefined) {
-      continue;
-    }
-
-    for (const outcome of HEALTH_OUTCOMES) {
-      lines.push(`nutsnews_worker_health_probe${labels({
-        environment,
-        service: PUBLICATION_STAGE_SERVICE,
-        outcome,
-        probe
-      })} ${current === outcome ? "1" : "0"}`);
-    }
-  }
-
-  return lines.join("\n");
 }
 
 function collectStageMetrics(

@@ -4,11 +4,15 @@ import type {
   RuntimeBrokerTransport,
   RuntimeClock,
   RuntimeHandlerResult,
+  RuntimeIdempotencyClaimReleaseResult,
+  RuntimeIdempotencyCompletion,
+  RuntimeIdempotencyFailure,
   RuntimeIdempotencyStore,
   RuntimeMessageContext
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import type { PublicationWriteMode } from "./config.js";
+import type { PublicationOperationDeadline } from "./operation-deadline.js";
 
 export type PublicationBackendOperation =
   | "shadow-publication-comparison"
@@ -37,16 +41,35 @@ export interface PublicationPermissionProbe extends PublicationDependencyProbe {
 export interface PublicationInboxStore extends RuntimeIdempotencyStore {
   readonly name: string;
   probe(): PublicationDependencyProbe | Promise<PublicationDependencyProbe>;
+  markCompleted(
+    idempotencyKey: string,
+    completion: RuntimeIdempotencyCompletion,
+    deadline?: PublicationOperationDeadline
+  ): Promise<void>;
+  markFailed(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure,
+    deadline?: PublicationOperationDeadline
+  ): Promise<void>;
+  releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure,
+    deadline?: PublicationOperationDeadline
+  ): Promise<RuntimeIdempotencyClaimReleaseResult>;
 }
 
 export interface PublicationDatabase {
   readonly name: string;
   probe(): PublicationDependencyProbe | Promise<PublicationDependencyProbe>;
   checkWriteScope(): PublicationPermissionProbe | Promise<PublicationPermissionProbe>;
-  withTransaction<T>(operation: (transaction: PublicationDatabaseTransaction) => Promise<T>): Promise<T>;
+  withTransaction<T>(
+    operation: (transaction: PublicationDatabaseTransaction) => Promise<T>,
+    deadline?: PublicationOperationDeadline
+  ): Promise<T>;
   recordReadinessEvaluation(
     transaction: PublicationDatabaseTransaction,
-    record: PublicationReadinessEvaluationRecord
+    record: PublicationReadinessEvaluationRecord,
+    deadline?: PublicationOperationDeadline
   ): Promise<PublicationReadinessEvaluationWriteResult>;
 }
 
@@ -270,18 +293,29 @@ export interface PublicationSnapshotReceipt {
 export interface PublicationSnapshotPublisher {
   readonly name: string;
   probe(): PublicationDependencyProbe | Promise<PublicationDependencyProbe>;
-  publishShadowComparison(command: PublicationSnapshotCommand): PublicationSnapshotReceipt | Promise<PublicationSnapshotReceipt>;
-  publishProductionSnapshot(command: PublicationSnapshotCommand): PublicationSnapshotReceipt | Promise<PublicationSnapshotReceipt>;
+  publishShadowComparison(
+    command: PublicationSnapshotCommand,
+    deadline?: PublicationOperationDeadline
+  ): PublicationSnapshotReceipt | Promise<PublicationSnapshotReceipt>;
+  publishProductionSnapshot(
+    command: PublicationSnapshotCommand,
+    deadline?: PublicationOperationDeadline
+  ): PublicationSnapshotReceipt | Promise<PublicationSnapshotReceipt>;
 }
 
 export interface PublicationBrokerOutbox {
   readonly name: string;
   probe(): PublicationDependencyProbe | Promise<PublicationDependencyProbe>;
-  record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void>;
+  record(
+    command: BrokerPublishCommand,
+    receipt: BrokerPublishReceipt,
+    deadline?: PublicationOperationDeadline
+  ): Promise<void>;
   hasReceipt(command: BrokerPublishCommand): Promise<boolean>;
 }
 
 export interface PublicationWorkTools {
+  assertActive(): void;
   publishBroker(command: BrokerPublishCommand): Promise<BrokerPublishReceipt>;
   recordBrokerOutbox(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void>;
   withTransaction<T>(operation: (transaction: PublicationDatabaseTransaction) => Promise<T>): Promise<T>;

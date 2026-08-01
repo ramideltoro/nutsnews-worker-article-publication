@@ -91,8 +91,13 @@ describe("publication Prometheus telemetry", () => {
       expect(stageEvents).toContain(`nutsnews_worker_uplift_stage_events_total{environment="production",service="publication",outcome="${outcome}"} ${expected}`);
     }
 
-    expect(output).toContain('nutsnews_worker_expected_active{environment="production",service="publication"} 0');
+    expect(output).toContain('nutsnews_worker_expected_active{environment="production",service="nutsnews-worker-article-publication"} 0');
+    expect(metricSeries(output, "nutsnews_worker_last_success_timestamp_seconds")).toEqual([
+      'nutsnews_worker_last_success_timestamp_seconds{environment="production",service="nutsnews-worker-article-publication"} 1785456001'
+    ]);
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="publication",le="0.005"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="publication",le="0.01"} 1');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="publication",le="0.025"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="publication",le="0.05"} 2');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="publication",le="30"} 3');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="production",service="publication",le="60"} 4');
@@ -125,9 +130,7 @@ describe("publication Prometheus telemetry", () => {
     });
 
     const initialOutput = shadow.collect();
-    expectHealthOneHot(initialOutput, "liveness", "ok");
-    expectHealthOneHot(initialOutput, "startup", "unhealthy");
-    expectHealthOneHot(initialOutput, "readiness", "unhealthy");
+    expect(initialOutput).not.toContain("nutsnews_worker_health_probe");
     expect(initialOutput).not.toContain("nutsnews_worker_dependency_duration_ms");
 
     await shadow.emit(health("liveness", "ok"));
@@ -142,11 +145,15 @@ describe("publication Prometheus telemetry", () => {
     });
 
     const shadowOutput = shadow.collect();
-    expect(shadowOutput).toContain('nutsnews_worker_expected_active{environment="shadow_environment_with_spaces",service="publication"} 0');
-    expect(shadowOutput).toContain('nutsnews_worker_health_probe{environment="shadow_environment_with_spaces",service="publication",outcome="ok",probe="liveness"} 1');
-    expect(shadowOutput).toContain('nutsnews_worker_health_probe{environment="shadow_environment_with_spaces",service="publication",outcome="ok",probe="startup"} 1');
-    expect(shadowOutput).toContain('nutsnews_worker_health_probe{environment="shadow_environment_with_spaces",service="publication",outcome="unhealthy",probe="readiness"} 1');
+    expect(shadowOutput).toContain('nutsnews_worker_expected_active{environment="shadow_environment_with_spaces",service="nutsnews-worker-article-publication"} 0');
+    expectHealthOneHot(shadowOutput, "liveness", "ok");
+    expectHealthOneHot(shadowOutput, "startup", "ok");
+    expectHealthOneHot(shadowOutput, "readiness", "unhealthy");
     expect(shadowOutput).not.toContain("unbounded-probe");
+    expect(shadowOutput.split("\n").filter((line) => line.startsWith("# HELP nutsnews_worker_health_check "))).toHaveLength(1);
+    expect(shadowOutput.split("\n").filter((line) => line.startsWith("# HELP nutsnews_worker_health_check_duration_seconds "))).toHaveLength(1);
+    expect(shadowOutput).toContain("nutsnews_worker_health_check{");
+    expect(shadowOutput).toContain("nutsnews_worker_health_check_duration_seconds_bucket{");
 
     const production = createPublicationPrometheusTelemetrySink({
       identity: {
@@ -157,10 +164,10 @@ describe("publication Prometheus telemetry", () => {
       },
       expectedActive: true
     });
-    expect(production.collect()).toContain('nutsnews_worker_expected_active{environment="production",service="publication"} 1');
+    expect(production.collect()).toContain('nutsnews_worker_expected_active{environment="production",service="nutsnews-worker-article-publication"} 1');
   });
 
-  it("does not fabricate legacy dependency durations for duration-less events", async () => {
+  it("does not fabricate dependency durations and exports Runtime 1.0 seconds histograms", async () => {
     const metrics = createPublicationPrometheusTelemetrySink({
       identity: {
         service: "nutsnews-worker-article-publication",
@@ -182,7 +189,9 @@ describe("publication Prometheus telemetry", () => {
         dependency: "publication-shell"
       }
     });
-    expect(metrics.collect()).not.toContain("nutsnews_worker_dependency_duration_ms");
+    const durationlessOutput = metrics.collect();
+    expect(durationlessOutput).not.toContain("nutsnews_worker_dependency_duration_ms");
+    expect(durationlessOutput).not.toContain("nutsnews_worker_dependency_duration_seconds");
 
     await metrics.emit({
       name: "runtime.dependency.observed",
@@ -196,7 +205,45 @@ describe("publication Prometheus telemetry", () => {
         dependency: "backend-api"
       }
     });
-    expect(metrics.collect()).toContain("nutsnews_worker_dependency_duration_ms");
+    const observedOutput = metrics.collect();
+    expect(observedOutput).not.toContain("nutsnews_worker_dependency_duration_ms");
+    expect(observedOutput).toContain("nutsnews_worker_dependency_duration_seconds_bucket");
+    expect(observedOutput).toContain("nutsnews_worker_dependency_duration_seconds_sum");
+    expect(observedOutput).toContain("nutsnews_worker_dependency_duration_seconds_count");
+  });
+
+  it("moves aggregate readiness and the consumer check together on channel loss", async () => {
+    const metrics = createPublicationPrometheusTelemetrySink({
+      identity: {
+        service: "nutsnews-worker-article-publication",
+        version: "0.1.0",
+        environment: "production",
+        host: "backend-vps"
+      },
+      expectedActive: true
+    });
+
+    await metrics.emit({
+      name: "runtime.broker.consumer_state_changed",
+      level: "error",
+      at: "2026-08-01T00:00:00.000Z",
+      stage: "publication",
+      queue: "nutsnews.worker.publication.v1",
+      outcome: "channel-dropped",
+      attributes: {
+        state: "channel-dropped",
+        activeConsumers: 0
+      }
+    });
+
+    const output = metrics.collect();
+    expectHealthOneHot(output, "readiness", "unhealthy");
+    expect(metricSampleValueByLabels(output, "nutsnews_worker_health_check", {
+      probe: "readiness",
+      check: "rabbitmq-consumer",
+      outcome: "unhealthy"
+    })).toBe(1);
+    expect(output).not.toContain("checks=[]");
   });
 });
 
@@ -246,11 +293,19 @@ function health(
     level: outcome === "ok" ? "info" : "warn",
     at: "2026-07-31T00:00:01.000Z",
     outcome,
-    attributes: {
-      probe,
-      status: outcome,
-      checkCount: 1
-    }
+      attributes: {
+        probe,
+        status: outcome,
+        checkCount: 1,
+        checks: [
+          {
+            name: `${probe}-check`,
+            status: outcome,
+            critical: true,
+            durationMs: 5
+          }
+        ]
+      }
   };
 }
 
@@ -286,6 +341,20 @@ function metricSampleValue(
     .find((candidate) => candidate.startsWith("nutsnews_worker_health_probe{")
       && candidate.includes(`probe="${probe}"`)
       && candidate.includes(`outcome="${outcome}"`));
+
+  expect(line).toBeDefined();
+  return Number(line?.split(" ").at(-1));
+}
+
+function metricSampleValueByLabels(
+  output: string,
+  metric: string,
+  requiredLabels: Readonly<Record<string, string>>
+): number {
+  const line = output
+    .split("\n")
+    .find((candidate) => candidate.startsWith(`${metric}{`)
+      && Object.entries(requiredLabels).every(([name, value]) => candidate.includes(`${name}="${value}"`)));
 
   expect(line).toBeDefined();
   return Number(line?.split(" ").at(-1));

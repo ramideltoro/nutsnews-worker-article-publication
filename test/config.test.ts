@@ -124,4 +124,11 @@ describe("loadPublicationConfig", () => {
       NUTSNEWS_PUBLICATION_PREFETCH: "2"
     })).toThrow(PublicationConfigError);
   });
+
+  it("fails closed when the production environment requests test adapters", () => {
+    expect(() => loadPublicationConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_PUBLICATION_DEPENDENCY_MODE: "test"
+    })).toThrow("NUTSNEWS_ENVIRONMENT=production requires NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production");
+  });
 });

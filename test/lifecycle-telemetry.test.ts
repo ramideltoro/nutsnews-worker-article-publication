@@ -49,9 +49,7 @@ describe("publication lifecycle telemetry", () => {
     const context = createTelemetryContext();
 
     const initialMetrics = context.metrics.collect();
-    expectHealthOneHot(initialMetrics, "liveness", "ok");
-    expectHealthOneHot(initialMetrics, "startup", "unhealthy");
-    expectHealthOneHot(initialMetrics, "readiness", "unhealthy");
+    expect(initialMetrics).not.toContain("nutsnews_worker_health_probe");
 
     await expect(context.service.health.liveness()).resolves.toMatchObject({
       probe: "liveness",
@@ -78,7 +76,7 @@ describe("publication lifecycle telemetry", () => {
     const startedMetrics = context.metrics.collect();
     expectHealthOneHot(startedMetrics, "liveness", "ok");
     expectHealthOneHot(startedMetrics, "startup", "ok");
-    expectHealthOneHot(startedMetrics, "readiness", "unhealthy");
+    expectHealthOneHot(startedMetrics, "readiness", "ok");
     expect(startedMetrics).not.toContain("nutsnews_worker_dependency_duration_ms");
 
     await expect(context.service.health.startup()).resolves.toMatchObject({
@@ -126,7 +124,8 @@ describe("publication lifecycle telemetry", () => {
     })).toBe(6);
     expect(sampleValue(metrics, "nutsnews_worker_uplift_stage_latency_seconds_sum")).toBe(1);
     expect(sampleValue(metrics, "nutsnews_worker_uplift_stage_latency_seconds_count")).toBe(6);
-    expect(metrics).toContain('nutsnews_worker_expected_active{environment="test",service="publication"} 0');
+    expect(metrics).toContain('nutsnews_worker_expected_active{environment="test",service="nutsnews-worker-article-publication"} 0');
+    expect(sampleValue(metrics, "nutsnews_worker_last_success_timestamp_seconds")).toBeGreaterThan(0);
     expect(metrics).not.toContain("nutsnews_worker_dependency_duration_ms");
     expect(context.metrics.allowedLabels).toEqual(RUNTIME_ALLOWED_METRIC_LABELS);
 
@@ -145,6 +144,12 @@ describe("publication lifecycle telemetry", () => {
     }
 
     await context.service.stop();
+    await expect(context.service.health.startup()).resolves.toMatchObject({
+      status: "unhealthy"
+    });
+    await expect(context.service.health.readiness()).resolves.toMatchObject({
+      status: "unhealthy"
+    });
     const stoppedMetrics = context.metrics.collect();
     expectHealthOneHot(stoppedMetrics, "liveness", "ok");
     expectHealthOneHot(stoppedMetrics, "startup", "unhealthy");
@@ -174,9 +179,6 @@ describe("publication lifecycle telemetry", () => {
         throw new Error("metrics unavailable");
       },
       setShutdownDraining: () => {
-        throw new Error("metrics unavailable");
-      },
-      setHealthProbe: () => {
         throw new Error("metrics unavailable");
       }
     };
@@ -236,13 +238,13 @@ describe("publication lifecycle telemetry", () => {
     },
     {
       operation: "markCompleted" as const,
-      expectedReason: "handler-error"
+      expectedReason: "idempotency-completion-error"
     },
     {
       operation: "markFailed" as const,
       expectedReason: "idempotency-failure-record-error"
     }
-  ])("contains Runtime 0.5 $operation rejection as one completed retry", async ({
+  ])("contains Runtime 1.0 $operation rejection as one completed retry", async ({
     operation,
     expectedReason
   }) => {
@@ -263,7 +265,7 @@ describe("publication lifecycle telemetry", () => {
     })).toBe(1);
   });
 
-  it("contains an exhausted Runtime 0.5 inbox rejection as one completed DLQ outcome", async () => {
+  it("contains an exhausted Runtime 1.0 inbox rejection as one completed DLQ outcome", async () => {
     const context = createInboxFailureContext("claim");
     const delivery = publicationDelivery(21, {
       attempt: {
@@ -479,7 +481,8 @@ function rejectingInboxStore(
       : store.markCompleted(idempotencyKey, completion),
     markFailed: (idempotencyKey, failure) => operation === "markFailed"
       ? reject()
-      : store.markFailed(idempotencyKey, failure)
+      : store.markFailed(idempotencyKey, failure),
+    releaseClaim: (idempotencyKey, failure) => store.releaseClaim(idempotencyKey, failure)
   };
 }
 

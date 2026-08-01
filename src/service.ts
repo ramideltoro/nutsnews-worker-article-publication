@@ -25,20 +25,24 @@ import {
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import type { PublicationConfig } from "./config.js";
-import type {
-  PublicationMetricsSink,
-  PublicationPrometheusTelemetrySink
-} from "./metrics.js";
+import type { PublicationMetricsSink } from "./metrics.js";
 import type {
   PublicationDependencies,
-  PublicationDependencyProbe
+  PublicationDependencyProbe,
+  PublicationInboxStore
 } from "./dependencies.js";
+import {
+  PublicationOperationDeadlineError,
+  createPublicationOperationDeadline,
+  type PublicationOperationDeadline
+} from "./operation-deadline.js";
 
 export interface PublicationServiceOptions {
   readonly config: PublicationConfig;
   readonly dependencies: PublicationDependencies;
   readonly telemetry?: RuntimeTelemetrySink;
   readonly metrics?: PublicationMetricsSink;
+  readonly operationDeadlineFactory?: () => PublicationOperationDeadline;
 }
 
 export interface PublicationService {
@@ -68,27 +72,70 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
   const drain = createRuntimeInFlightDrainController({
     timeoutMs: options.config.shutdownTimeoutMs
   });
-  const sharedProcessor = createRuntimeMessageProcessor({
+  const createSharedProcessor = (deadlineRef: PublicationOperationDeadlineRef) => createRuntimeMessageProcessor({
     stage: "publication",
-    idempotencyStore: classifyInboxStoreFailures(options.dependencies.inboxStore),
+    idempotencyStore: classifyInboxStoreFailures(
+      options.dependencies.inboxStore,
+      () => deadlineRef.current
+    ),
     clock: options.dependencies.clock,
     ...(telemetry === undefined ? {} : {
       telemetry
     }),
     handler: async (context) => {
+      const operationDeadline = (options.operationDeadlineFactory ?? createPublicationOperationDeadline)();
+      deadlineRef.current = operationDeadline;
+
       try {
         return await drain.track(async () => {
+          operationDeadline.assertActive();
           setInFlight(options.metrics, publicationRoute.mainQueue.name, drain.inFlight);
           const result = await options.dependencies.workHandler.handle(context, {
-            publishBroker: (command) => broker.publish(command),
-            recordBrokerOutbox: (command, receipt) => options.dependencies.brokerOutbox.record(command, receipt),
-            withTransaction: (operation) => options.dependencies.database.withTransaction(operation),
-            recordReadinessEvaluation: (transaction, record) => options.dependencies.database.recordReadinessEvaluation(transaction, record),
-            publishShadowComparison: async (command) => options.dependencies.snapshotPublisher.publishShadowComparison(command),
-            publishProductionSnapshot: async (command) => options.dependencies.snapshotPublisher.publishProductionSnapshot(command)
+            assertActive: () => operationDeadline.assertActive(),
+            publishBroker: (command) => guardedPublicationOperation(
+              operationDeadline,
+              () => broker.publish(command)
+            ),
+            recordBrokerOutbox: (command, receipt) => guardedPublicationOperation(
+              operationDeadline,
+              () => options.dependencies.brokerOutbox.record(command, receipt, operationDeadline)
+            ),
+            withTransaction: (operation) => guardedPublicationOperation(
+              operationDeadline,
+              () => options.dependencies.database.withTransaction(
+                (transaction) => guardedPublicationOperation(
+                  operationDeadline,
+                  () => operation(transaction)
+                ),
+                operationDeadline
+              )
+            ),
+            recordReadinessEvaluation: (transaction, record) => guardedPublicationOperation(
+              operationDeadline,
+              () => options.dependencies.database.recordReadinessEvaluation(
+                transaction,
+                record,
+                operationDeadline
+              )
+            ),
+            publishShadowComparison: (command) => guardedPublicationOperation(
+              operationDeadline,
+              () => Promise.resolve(options.dependencies.snapshotPublisher.publishShadowComparison(
+                command,
+                operationDeadline
+              ))
+            ),
+            publishProductionSnapshot: (command) => guardedPublicationOperation(
+              operationDeadline,
+              () => Promise.resolve(options.dependencies.snapshotPublisher.publishProductionSnapshot(
+                command,
+                operationDeadline
+              ))
+            )
           });
+          operationDeadline.assertActive();
 
-          await emitRuntimeTelemetry(telemetry, {
+          await deadlineBoundTelemetry(operationDeadline, emitRuntimeTelemetry(telemetry, {
             name: "runtime.dependency.observed",
             level: result.status === "ok" ? "info" : "warn",
             at: runtimeNow(options.dependencies.clock),
@@ -102,7 +149,8 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
               policyId: options.config.readiness.policyId,
               productionWriteConfirmationPresent: options.config.security.productionWriteConfirmationPresent
             }
-          });
+          }));
+          operationDeadline.assertActive();
 
           return result;
         });
@@ -113,17 +161,21 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
   });
   const processor = async (delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> => {
     const startedAtMs = options.dependencies.clock.now().getTime();
+    const deadlineRef: PublicationOperationDeadlineRef = {};
+    const sharedProcessor = createSharedProcessor(deadlineRef);
 
     try {
       return await sharedProcessor(delivery);
     } catch (error: unknown) {
-      return completeProcessorFailure(
+      return await completeProcessorFailure(
         delivery,
         error,
         telemetry,
         options.dependencies.clock,
         startedAtMs
       );
+    } finally {
+      deadlineRef.current?.dispose();
     }
   };
   let started = false;
@@ -159,7 +211,7 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
         })
       });
 
-      return observeHealthProbes(probes, options.metrics);
+      return observeHealthProbes(probes);
     },
     get isStarted(): boolean {
       return started;
@@ -181,11 +233,10 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
         stage: brokerConsumer.stage,
         cancel: async () => {
           await brokerConsumer.cancel();
-          setHealthProbe(options.metrics, "readiness", "unhealthy");
+          await service.health.readiness();
         }
       };
       started = true;
-      setHealthProbe(options.metrics, "startup", "ok");
       setInFlight(options.metrics, publicationRoute.mainQueue.name, drain.inFlight);
       await emitRuntimeTelemetry(telemetry, {
         name: "runtime.dependency.observed",
@@ -204,6 +255,8 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
           writeMode: options.config.writeMode
         }
       });
+      await service.health.startup();
+      await service.health.readiness();
     },
     async stop(): Promise<void> {
       if (!started && broker.state === "closed") {
@@ -216,10 +269,10 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
       await broker.stop("shutdown");
       setShutdownDraining(options.metrics, false);
       setInFlight(options.metrics, publicationRoute.mainQueue.name, drain.inFlight);
-      setHealthProbe(options.metrics, "startup", "unhealthy");
-      setHealthProbe(options.metrics, "readiness", "unhealthy");
       consumer = undefined;
       started = false;
+      await service.health.startup();
+      await service.health.readiness();
     },
     processDelivery(delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> {
       return processor(delivery);
@@ -229,15 +282,59 @@ export function createPublicationService(options: PublicationServiceOptions): Pu
   return service;
 }
 
-function setHealthProbe(
-  metrics: PublicationMetricsSink | undefined,
-  probe: "liveness" | "startup" | "readiness",
-  outcome: "ok" | "degraded" | "unhealthy"
-): void {
-  runBestEffort(() => {
-    if (isPublicationMetrics(metrics)) {
-      metrics.setHealthProbe(probe, outcome);
+interface PublicationOperationDeadlineRef {
+  current?: PublicationOperationDeadline;
+}
+
+async function guardedPublicationOperation<T>(
+  deadline: PublicationOperationDeadline,
+  operation: () => Promise<T>
+): Promise<T> {
+  deadline.assertActive();
+  const value = await operation();
+  deadline.assertActive();
+  return value;
+}
+
+async function deadlineBoundTelemetry(
+  deadline: PublicationOperationDeadline,
+  operation: Promise<void>
+): Promise<void> {
+  deadline.assertActive();
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const onAbort = (): void => {
+      if (!settled) {
+        settled = true;
+        reject(deadline.signal.reason instanceof Error
+          ? deadline.signal.reason
+          : new PublicationOperationDeadlineError());
+      }
+    };
+
+    deadline.signal.addEventListener("abort", onAbort, {
+      once: true
+    });
+    if (deadline.signal.aborted) {
+      onAbort();
     }
+    void operation.then(
+      () => {
+        if (!settled) {
+          settled = true;
+          deadline.signal.removeEventListener("abort", onAbort);
+          resolve();
+        }
+      },
+      () => {
+        if (!settled) {
+          settled = true;
+          deadline.signal.removeEventListener("abort", onAbort);
+          resolve();
+        }
+      }
+    );
   });
 }
 
@@ -289,30 +386,19 @@ function bestEffortTelemetrySink(sink: RuntimeTelemetrySink | undefined): Runtim
 }
 
 function observeHealthProbes(
-  probes: RuntimeHealthProbeSet,
-  metrics: PublicationMetricsSink | undefined
+  probes: RuntimeHealthProbeSet
 ): RuntimeHealthProbeSet {
   const observe = async <T extends RuntimeHealthReport>(
-    probe: "liveness" | "startup" | "readiness",
     operation: () => Promise<T>
   ): Promise<T> => {
-    const report = await operation();
-    setHealthProbe(metrics, probe, report.status);
-
-    return report;
+    return operation();
   };
 
   return {
-    liveness: () => observe("liveness", () => probes.liveness()),
-    startup: () => observe("startup", () => probes.startup()),
-    readiness: () => observe("readiness", () => probes.readiness())
+    liveness: () => observe(() => probes.liveness()),
+    startup: () => observe(() => probes.startup()),
+    readiness: () => observe(() => probes.readiness())
   };
-}
-
-function isPublicationMetrics(
-  metrics: PublicationMetricsSink | undefined
-): metrics is PublicationPrometheusTelemetrySink {
-  return metrics !== undefined && "setHealthProbe" in metrics && typeof metrics.setHealthProbe === "function";
 }
 
 class PublicationInboxStoreError extends Error {
@@ -325,7 +411,10 @@ class PublicationInboxStoreError extends Error {
   }
 }
 
-function classifyInboxStoreFailures(store: RuntimeIdempotencyStore): RuntimeIdempotencyStore {
+function classifyInboxStoreFailures(
+  store: PublicationInboxStore,
+  getDeadline: () => PublicationOperationDeadline | undefined
+): RuntimeIdempotencyStore {
   return {
     claim: async (idempotencyKey, context) => inboxStoreOperation(
       "idempotency-claim-error",
@@ -333,13 +422,36 @@ function classifyInboxStoreFailures(store: RuntimeIdempotencyStore): RuntimeIdem
     ),
     markCompleted: async (idempotencyKey, completion) => inboxStoreOperation(
       "idempotency-completion-error",
-      () => store.markCompleted(idempotencyKey, completion)
+      () => guardedPublicationInboxOperation(
+        getDeadline(),
+        (deadline) => store.markCompleted(idempotencyKey, completion, deadline)
+      )
     ),
     markFailed: async (idempotencyKey, failure) => inboxStoreOperation(
       "idempotency-failure-record-error",
-      () => store.markFailed(idempotencyKey, failure)
+      () => guardedPublicationInboxOperation(
+        getDeadline(),
+        (deadline) => store.markFailed(idempotencyKey, failure, deadline)
+      )
+    ),
+    releaseClaim: async (idempotencyKey, failure) => inboxStoreOperation(
+      "idempotency-release-error",
+      () => guardedPublicationInboxOperation(
+        getDeadline(),
+        (deadline) => store.releaseClaim(idempotencyKey, failure, deadline)
+      )
     )
   };
+}
+
+async function guardedPublicationInboxOperation<T>(
+  deadline: PublicationOperationDeadline | undefined,
+  operation: (deadline: PublicationOperationDeadline | undefined) => Promise<T>
+): Promise<T> {
+  deadline?.assertActive();
+  const value = await operation(deadline);
+  deadline?.assertActive();
+  return value;
 }
 
 async function inboxStoreOperation<T>(reason: string, operation: () => Promise<T>): Promise<T> {

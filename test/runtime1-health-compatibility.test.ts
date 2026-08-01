@@ -26,7 +26,15 @@ vi.mock("@ramideltoro/nutsnews-worker-runtime", async (importOriginal) => {
           runtime1Delegate.output = [
             "# HELP nutsnews_worker_health_probe Worker liveness, startup, and readiness state by probe and outcome.",
             "# TYPE nutsnews_worker_health_probe gauge",
-            'nutsnews_worker_health_probe{environment="production",host="backend-vps",service="nutsnews-worker-article-publication",version="1.0.0",outcome="degraded",probe="readiness"} 1'
+            'nutsnews_worker_health_probe{environment="production",host="backend-vps",service="nutsnews-worker-article-publication",version="1.0.0",outcome="degraded",probe="readiness"} 1',
+            "# HELP nutsnews_worker_health_check Worker dependency health state.",
+            "# TYPE nutsnews_worker_health_check gauge",
+            'nutsnews_worker_health_check{environment="production",host="backend-vps",service="nutsnews-worker-article-publication",version="1.0.0",outcome="degraded",probe="readiness",check="database"} 1',
+            "# HELP nutsnews_worker_health_check_duration_seconds Worker dependency health latency.",
+            "# TYPE nutsnews_worker_health_check_duration_seconds histogram",
+            'nutsnews_worker_health_check_duration_seconds_bucket{environment="production",host="backend-vps",service="nutsnews-worker-article-publication",version="1.0.0",probe="readiness",check="database",le="+Inf"} 1',
+            'nutsnews_worker_health_check_duration_seconds_sum{environment="production",host="backend-vps",service="nutsnews-worker-article-publication",version="1.0.0",probe="readiness",check="database"} 0.005',
+            'nutsnews_worker_health_check_duration_seconds_count{environment="production",host="backend-vps",service="nutsnews-worker-article-publication",version="1.0.0",probe="readiness",check="database"} 1'
           ].join("\n");
         }
       },
@@ -51,7 +59,7 @@ describe("Runtime1 health metric compatibility", () => {
     runtime1Delegate.output = "";
   });
 
-  it("keeps the service-owned health family singular while other events reach Runtime1", async () => {
+  it("forwards health once and leaves every health family solely owned by Runtime1", async () => {
     const metrics = createPublicationPrometheusTelemetrySink({
       identity: {
         service: "nutsnews-worker-article-publication",
@@ -72,7 +80,15 @@ describe("Runtime1 health metric compatibility", () => {
       outcome: "degraded",
       attributes: {
         probe: "readiness",
-        status: "degraded"
+        status: "degraded",
+        checks: [
+          {
+            name: "database",
+            status: "degraded",
+            critical: true,
+            durationMs: 5
+          }
+        ]
       }
     });
     await metrics.emit({
@@ -90,15 +106,19 @@ describe("Runtime1 health metric compatibility", () => {
     const healthSeries = healthSamples.map((line) => line.slice(0, line.lastIndexOf(" ")));
 
     expect(runtime1Delegate.emittedEventNames).toEqual([
+      "runtime.health.evaluated",
       "runtime.message.started"
     ]);
     expect(lines.filter((line) => line.startsWith("# HELP nutsnews_worker_health_probe "))).toHaveLength(1);
     expect(lines.filter((line) => line === "# TYPE nutsnews_worker_health_probe gauge")).toHaveLength(1);
-    expect(healthSamples).toHaveLength(9);
+    expect(healthSamples).toHaveLength(1);
     expect(new Set(healthSeries).size).toBe(healthSamples.length);
+    expect(lines.filter((line) => line.startsWith("# HELP nutsnews_worker_health_check "))).toHaveLength(1);
+    expect(lines.filter((line) => line.startsWith("# HELP nutsnews_worker_health_check_duration_seconds "))).toHaveLength(1);
+    expect(lines.filter((line) => line.startsWith("nutsnews_worker_health_check{"))).toHaveLength(1);
+    expect(lines.filter((line) => line.startsWith("nutsnews_worker_health_check_duration_seconds_count{"))).toHaveLength(1);
     expect(output).toContain(
-      'nutsnews_worker_health_probe{environment="production",service="publication",outcome="degraded",probe="readiness"} 1'
+      'nutsnews_worker_health_probe{environment="production",host="backend-vps",service="nutsnews-worker-article-publication",version="1.0.0",outcome="degraded",probe="readiness"} 1'
     );
-    expect(output).not.toContain('nutsnews_worker_health_probe{environment="production",host="backend-vps"');
   });
 });

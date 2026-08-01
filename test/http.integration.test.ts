@@ -86,7 +86,7 @@ describe("createPublicationHttpServer", () => {
     expect(metricsBody).not.toContain("nutsnews_worker_dependency_duration_ms");
     expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
     expect(metricsBody).toContain("nutsnews_worker_health_probe");
-    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="publication"} 0');
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="nutsnews-worker-article-publication"} 0');
     expect(metricsBody).toContain('outcome="ok",probe="liveness"} 1');
     expect(metricsBody).toContain('outcome="ok",probe="startup"} 1');
     expect(metricsBody).toContain('outcome="ok",probe="readiness"} 1');

@@ -25,7 +25,8 @@ This service establishes the publication runtime, health/status/metrics surface,
 The publication service is the terminal-success SLO producer for the worker-uplift pipeline. Its `/metrics` endpoint exports:
 
 - `nutsnews_worker_uplift_stage_events_total{environment,service="publication",outcome}` for the bounded outcomes `success`, `duplicate`, `invalid`, `retry`, `dlq`, and `failure`; all six series are seeded even though publication terminal failures are classified as `dlq`;
-- `nutsnews_worker_uplift_stage_latency_seconds`, a fixed-bucket Prometheus histogram with boundaries `0.01`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, and `300` seconds plus `+Inf`;
+- `nutsnews_worker_uplift_stage_latency_seconds`, a fixed-bucket Prometheus histogram with boundaries `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, and `300` seconds plus `+Inf`;
+- Runtime-owned `nutsnews_worker_health_probe`, `nutsnews_worker_health_check`, and `nutsnews_worker_health_check_duration_seconds` series for bounded probe/check state and latency;
 - `nutsnews_worker_expected_active{environment,service="publication"}`, which is `0` in the default shadow-comparison mode and becomes `1` only with the protected production write-mode cutover;
 - distinct `nutsnews_worker_health_probe` liveness, startup, and readiness series, plus the runtime-owned active-consumer signal for the contracted publication queue.
 
@@ -33,7 +34,13 @@ Each delivery attempt produces exactly one completing lifecycle outcome. `succes
 
 Content/feed freshness is intentionally not inferred in this process. The backend host's durable content exporter owns feed-age telemetry.
 
-The health series are one-hot and present before the first scrape: liveness initializes healthy, startup and readiness initialize fail-closed, startup follows the service lifecycle, and readiness changes only from a real readiness evaluation or a known consumer shutdown. Telemetry, log, metric, and telemetry-flush failures are best effort and cannot change acknowledgement, idempotency, retry, DLQ, or protected publication-write behavior. Duration-less dependency events remain available in structured logs but are not forwarded into legacy duration summaries, and startup does not create a fabricated zero-millisecond dependency observation.
+The Runtime-owned health series are one-hot after each real probe evaluation; the service does not fabricate startup, readiness, dependency, or duration observations. Runtime also solely owns expected-active, consumer, build/deployment, and last-success series. Last success advances only for accepted or duplicate completion, and expected-active becomes `1` only for the protected production adapter/write-owner configuration. Telemetry, log, metric, and telemetry-flush failures are best effort and cannot change acknowledgement, idempotency, retry, DLQ, or protected publication-write behavior. Duration-less dependency events remain available in structured logs but are not forwarded into legacy duration summaries.
+
+The production inbox implements the Runtime 1.0 idempotency contract with an opaque token and an exact five-minute claim lease. Completion, failure, and conditional release are compare-and-set operations against the exact active, unexpired token. Legacy tokenless processing rows first receive the same five-minute migration grace lease and become reclaimable only after it expires; expired owners, completed work, and claims owned by another delivery are never downgraded.
+
+PostgreSQL is the sole lease-time authority. Production database acquisition is capped at 10 seconds, lock waits at 5 seconds, statements at 15 seconds, client queries at 20 seconds, and idle transactions at 30 seconds. Database URLs may not override those controls through timeout or startup-option parameters. Backend publication calls are capped at 10 seconds each and broker confirms use the Contracts 1.0 five-second limit.
+
+Every claimed handler receives a 150-second monotonic deadline. The deadline is checked before and after policy evaluation, transaction work, broker publication, outbox writes, backend commands, and shadow/production publication. Its abort signal is also combined with each backend request timeout. PostgreSQL independently rejects completion, failure, and release after the server-time lease boundary. The conservative wall budget includes the 20-second claim-response tail and three separately acquired final-transition operations: 260 seconds total with a 40-second reserve inside the exact five-minute ownership lease.
 
 ## Policy-Driven Gate
 
@@ -109,7 +116,7 @@ This repository owns its package or service implementation, CI, package or image
 
 ## Package / Image Access
 
-Backend deployments consume immutable SHA-tagged GHCR images. The only intended production package consumer is `ramideltoro/nutsnews-backend/.github/workflows/protected-backend-ansible-apply.yml` with `packages: read`.
+The publish workflow produces SHA-tagged GHCR images. Backend deployments must resolve the verified signed manifest digest and pin `ghcr.io/ramideltoro/nutsnews-worker-article-publication@sha256:...`; a SHA-shaped tag alone is not an immutable registry reference. The only intended production package consumer is `ramideltoro/nutsnews-backend/.github/workflows/protected-backend-ansible-apply.yml` with `packages: read`.
 
 No long-lived GitHub Packages token is required for CI. Workflows use least-privilege permissions and request `packages: write` only for publish jobs.
 
