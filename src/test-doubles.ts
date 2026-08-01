@@ -757,6 +757,7 @@ export function createLocalPublicationDependencies(config = loadPublicationConfi
 export function createProductionCapableLocalPublicationConfig(): PublicationConfig {
   return loadPublicationConfig({
     NUTSNEWS_PUBLICATION_DEPENDENCY_MODE: "production",
+    NUTSNEWS_PUBLICATION_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
     NUTSNEWS_PUBLICATION_DATABASE_URL: "postgres://example.invalid/publication",
     NUTSNEWS_PUBLICATION_RABBITMQ_URL: "amqp://example.invalid",
     NUTSNEWS_PUBLICATION_BACKEND_API_BASE_URL: "https://backend.example.invalid/worker",

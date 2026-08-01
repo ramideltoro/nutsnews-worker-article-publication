@@ -3,7 +3,6 @@ import { pathToFileURL } from "node:url";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createJsonRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   SYSTEM_RUNTIME_CLOCK,
   getRuntimePackageMetadata,
@@ -15,7 +14,9 @@ import {
   type PublicationConfig
 } from "./config.js";
 import { createPublicationHttpServer } from "./http.js";
+import { createPublicationPrometheusTelemetrySink } from "./metrics.js";
 import { createProductionPublicationDependencies } from "./production.js";
+import type { PublicationDependencies } from "./dependencies.js";
 import type { PublicationReconciler } from "./reconciliation.js";
 import { createPublicationService } from "./service.js";
 import { createLocalPublicationDependencies } from "./test-doubles.js";
@@ -59,6 +60,17 @@ export {
   createPublicationHttpServer,
   type PublicationHttpServer
 } from "./http.js";
+export {
+  PUBLICATION_STAGE_LATENCY_BUCKETS_SECONDS,
+  PUBLICATION_STAGE_OUTCOMES,
+  createPublicationPrometheusTelemetrySink,
+  type PublicationMetricsSink,
+  type PublicationPrometheusTelemetrySink,
+  type PublicationPrometheusTelemetrySinkOptions,
+  type PublicationHealthOutcome,
+  type PublicationHealthProbe,
+  type PublicationStageOutcome
+} from "./metrics.js";
 export {
   PUBLICATION_RECONCILIATION_CONFIRMATION,
   PUBLICATION_RECONCILIATION_PATH,
@@ -118,13 +130,25 @@ export interface PublicationApplication {
   stop(): Promise<void>;
 }
 
-export function createPublicationApplication(config = loadPublicationConfig()): PublicationApplication {
+export interface PublicationApplicationOptions {
+  readonly dependencies?: PublicationDependencies;
+}
+
+export function createPublicationApplication(
+  config = loadPublicationConfig(),
+  options: PublicationApplicationOptions = {}
+): PublicationApplication {
   const identity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
-    host: config.host
-  };
+    host: config.host,
+    revision: config.buildRevision,
+    deployment: config.dependencyMode === "production"
+      ? config.writeMode === "production" ? "production" : "shadow"
+      : config.environment === "test" ? "test" : "local",
+    adapter: config.dependencyMode === "production" ? "production" : "in_memory"
+  } as const;
   const logSink = config.telemetryLogs === "stdout"
     ? createJsonRuntimeTelemetrySink({
         identity,
@@ -134,20 +158,23 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
       })
     : undefined;
   const metrics = config.metricsEnabled
-    ? createPrometheusRuntimeTelemetrySink({
-        identity
+    ? createPublicationPrometheusTelemetrySink({
+        identity,
+        expectedActive: config.writeMode === "production"
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = config.dependencyMode === "production"
-    ? createProductionPublicationDependencies({
-        config,
-        clock: SYSTEM_RUNTIME_CLOCK,
-        ...(telemetry === undefined ? {} : {
-          telemetry
+  const dependencies = options.dependencies ?? (
+    config.dependencyMode === "production"
+      ? createProductionPublicationDependencies({
+          config,
+          clock: SYSTEM_RUNTIME_CLOCK,
+          ...(telemetry === undefined ? {} : {
+            telemetry
+          })
         })
-      })
-    : createLocalPublicationDependencies(config);
+      : createLocalPublicationDependencies(config)
+  );
   const service = createPublicationService({
     config,
     dependencies,
@@ -191,7 +218,15 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
       telemetry
     }),
     ...(logSink === undefined ? {} : {
-      telemetryFlusher: logSink
+      telemetryFlusher: {
+        flush: async () => {
+          try {
+            await logSink.flush();
+          } catch {
+            // Telemetry flushing is best effort and must not block shutdown.
+          }
+        }
+      }
     })
   });
 
@@ -199,14 +234,48 @@ export function createPublicationApplication(config = loadPublicationConfig()): 
     config,
     async start(): Promise<void> {
       assertPackageCompatibility();
-      await service.start();
-      await httpServer.listen();
-      shutdown.start();
+      let listenerStarted = false;
+
+      try {
+        await httpServer.listen();
+        listenerStarted = true;
+        shutdown.start();
+        await service.start();
+      } catch (error: unknown) {
+        shutdown.stop();
+        await cleanupFailedInitialization(httpServer, service, dependencies, listenerStarted);
+        throw error;
+      }
     },
     async stop(): Promise<void> {
       await shutdown.trigger("manual");
     }
   };
+}
+
+async function cleanupFailedInitialization(
+  httpServer: ReturnType<typeof createPublicationHttpServer>,
+  service: ReturnType<typeof createPublicationService>,
+  dependencies: PublicationDependencies,
+  listenerStarted: boolean
+): Promise<void> {
+  if (listenerStarted) {
+    await ignoreCleanupFailure(() => httpServer.close());
+  }
+
+  await ignoreCleanupFailure(() => service.stop());
+
+  if (hasClose(dependencies)) {
+    await ignoreCleanupFailure(() => dependencies.close());
+  }
+}
+
+async function ignoreCleanupFailure(operation: () => Promise<void>): Promise<void> {
+  try {
+    await operation();
+  } catch {
+    // Preserve the initialization error after attempting every cleanup step.
+  }
 }
 
 function hasClose(value: unknown): value is { close(): Promise<void> } {
@@ -244,7 +313,11 @@ function combineTelemetrySinks(
   return {
     emit: async (event) => {
       for (const sink of configured) {
-        await sink.emit(event);
+        try {
+          await sink.emit(event);
+        } catch {
+          // Each telemetry sink is isolated so another sink can still receive the event.
+        }
       }
     }
   };

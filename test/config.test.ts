@@ -19,6 +19,7 @@ describe("loadPublicationConfig", () => {
     expect(config).toMatchObject({
       serviceName: "nutsnews-worker-article-publication",
       dependencyMode: "test",
+      buildRevision: "development",
       host: "publication-host",
       writeMode: "shadow_comparison",
       concurrency: 1,
@@ -61,7 +62,8 @@ describe("loadPublicationConfig", () => {
         "NUTSNEWS_PUBLICATION_DATABASE_URL is required when NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.",
         "NUTSNEWS_PUBLICATION_RABBITMQ_URL is required when NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.",
         "NUTSNEWS_PUBLICATION_BACKEND_API_BASE_URL is required when NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.",
-        "NUTSNEWS_PUBLICATION_BACKEND_API_TOKEN is required when NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production."
+        "NUTSNEWS_PUBLICATION_BACKEND_API_TOKEN is required when NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production.",
+        "NUTSNEWS_PUBLICATION_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_PUBLICATION_DEPENDENCY_MODE=production."
       ]);
       expect(configError.message).not.toContain("postgres://");
       expect(configError.message).not.toContain("amqp://");
@@ -77,6 +79,7 @@ describe("loadPublicationConfig", () => {
 
     expect(() => loadPublicationConfig({
       NUTSNEWS_PUBLICATION_DEPENDENCY_MODE: "production",
+      NUTSNEWS_PUBLICATION_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
       NUTSNEWS_PUBLICATION_DATABASE_URL: "postgres://example.invalid/publication",
       NUTSNEWS_PUBLICATION_RABBITMQ_URL: "amqp://example.invalid",
       NUTSNEWS_PUBLICATION_BACKEND_API_BASE_URL: "https://backend.example.invalid/worker",
@@ -89,6 +92,7 @@ describe("loadPublicationConfig", () => {
   it("accepts protected production mode without retaining secret values", () => {
     const config = loadPublicationConfig({
       NUTSNEWS_PUBLICATION_DEPENDENCY_MODE: "production",
+      NUTSNEWS_PUBLICATION_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
       NUTSNEWS_PUBLICATION_DATABASE_URL: "postgres://example.invalid/publication",
       NUTSNEWS_PUBLICATION_RABBITMQ_URL: "amqp://example.invalid",
       NUTSNEWS_PUBLICATION_BACKEND_API_BASE_URL: "https://backend.example.invalid/worker",
@@ -99,6 +103,7 @@ describe("loadPublicationConfig", () => {
     });
 
     expect(config.writeMode).toBe("production");
+    expect(config.buildRevision).toBe("0123456789abcdef0123456789abcdef01234567");
     expect(config.security.productionWriteConfirmationPresent).toBe(true);
     expect(config.dependencies).toEqual({
       databaseConfigured: true,

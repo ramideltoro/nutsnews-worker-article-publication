@@ -20,6 +20,21 @@ This service establishes the publication runtime, health/status/metrics surface,
 - Keeps `shadow_comparison` as the hard default. Production writes require production dependency mode, configured backend/database/broker/API presence, and the protected confirmation value from backend-owned deployment.
 - Contains no feed fetching, page fetching, AI generation, translation generation, general persistence, direct production snapshot SQL, Cloudflare KV writes, or legacy ingestion logic.
 
+## Observability Contract
+
+The publication service is the terminal-success SLO producer for the worker-uplift pipeline. Its `/metrics` endpoint exports:
+
+- `nutsnews_worker_uplift_stage_events_total{environment,service="publication",outcome}` for the bounded outcomes `success`, `duplicate`, `invalid`, `retry`, and `dlq`;
+- `nutsnews_worker_uplift_stage_latency_seconds`, a fixed-bucket Prometheus histogram with boundaries `0.01`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, and `300` seconds plus `+Inf`;
+- `nutsnews_worker_expected_active{environment,service="publication"}`, which is `0` in the default shadow-comparison mode and becomes `1` only with the protected production write-mode cutover;
+- distinct `nutsnews_worker_health_probe` liveness, startup, and readiness series, plus the runtime-owned active-consumer signal for the contracted publication queue.
+
+Each delivery attempt produces exactly one completing lifecycle outcome. `success` and `duplicate` are the SLO good events. The terminal denominator is `success|duplicate|invalid|failure|dlq`; `retry` is intentionally excluded because it is not terminal. Publication handler terminal failures are routed to the DLQ and therefore recorded as `dlq`. No message, article, correlation, trace, or idempotency identifier is used as a Prometheus label.
+
+Content/feed freshness is intentionally not inferred in this process. The backend host's durable content exporter owns feed-age telemetry.
+
+The health series are one-hot and present before the first scrape: liveness initializes healthy, startup and readiness initialize fail-closed, startup follows the service lifecycle, and readiness changes only from a real readiness evaluation or a known consumer shutdown. Telemetry, log, metric, and telemetry-flush failures are best effort and cannot change acknowledgement, idempotency, retry, DLQ, or protected publication-write behavior. Duration-less dependency events remain available in structured logs but are not forwarded into legacy duration summaries, and startup does not create a fabricated zero-millisecond dependency observation.
+
 ## Policy-Driven Gate
 
 The captured backend policy version is `2026-07-23.worker-uplift-api-admin-compatibility-contract.v1`, based on the #68/#140 evidence. Its hold-for-translations default requires `fr`, `ja`, `de-CH`, `de`, and `el` summaries before an article can be ready.
@@ -48,6 +63,7 @@ The `/status` and `/config-schema` endpoints expose readiness policy, write mode
 
 | Variable | Default | Production | Sensitive |
 | --- | --- | --- | --- |
+| `NUTSNEWS_PUBLICATION_BUILD_REVISION` | `development` | required lowercase 40-character Git SHA | no |
 | `NUTSNEWS_PUBLICATION_DATABASE_URL` | unset | required | yes |
 | `NUTSNEWS_PUBLICATION_RABBITMQ_URL` | unset | required | yes |
 | `NUTSNEWS_PUBLICATION_BACKEND_API_BASE_URL` | unset | required | yes |

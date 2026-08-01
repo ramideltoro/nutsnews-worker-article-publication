@@ -1,7 +1,4 @@
 import {
-  createPrometheusRuntimeTelemetrySink
-} from "@ramideltoro/nutsnews-worker-runtime";
-import {
   afterEach,
   describe,
   expect,
@@ -13,12 +10,16 @@ import {
   createPublicationHttpServer,
   type PublicationHttpServer
 } from "../src/http.js";
+import { createPublicationPrometheusTelemetrySink } from "../src/metrics.js";
 import type {
   PublicationReconciliationReport,
   PublicationReconciler
 } from "../src/reconciliation.js";
 import { createPublicationService } from "../src/service.js";
-import { createLocalPublicationDependencies } from "../src/test-doubles.js";
+import {
+  createLocalPublicationDependencies,
+  createMinimalPublicationDelivery
+} from "../src/test-doubles.js";
 
 describe("createPublicationHttpServer", () => {
   let server: PublicationHttpServer | undefined;
@@ -39,17 +40,19 @@ describe("createPublicationHttpServer", () => {
       NUTSNEWS_PUBLICATION_BACKEND_API_TOKEN: "secret-not-real",
       NUTSNEWS_PUBLICATION_TELEMETRY_LOGS: "silent"
     });
-    const metrics = createPrometheusRuntimeTelemetrySink({
+    const metrics = createPublicationPrometheusTelemetrySink({
       identity: {
         service: config.serviceName,
         version: config.serviceVersion,
         environment: config.environment,
         host: config.host
-      }
+      },
+      expectedActive: false
     });
     service = createPublicationService({
       config,
       dependencies: createLocalPublicationDependencies(config),
+      telemetry: metrics,
       metrics
     });
     server = createPublicationHttpServer({
@@ -60,16 +63,40 @@ describe("createPublicationHttpServer", () => {
 
     await service.start();
     await server.listen();
+    await service.processDelivery(createMinimalPublicationDelivery());
 
     const live = await fetch(server.url("/live"));
+    const startup = await fetch(server.url("/startup"));
     const ready = await fetch(server.url("/ready"));
     const metricsResponse = await fetch(server.url("/metrics"));
     const schema = await fetch(server.url("/config-schema"));
     const status = await fetch(server.url("/status"));
 
     expect(live.status).toBe(200);
+    expect(startup.status).toBe(200);
     expect(ready.status).toBe(200);
-    expect(await metricsResponse.text()).toContain("nutsnews_worker_dependency_duration_ms");
+    const metricsBody = await metricsResponse.text();
+    const readyBody = await ready.json() as {
+      readonly checks: readonly {
+        readonly name: string;
+        readonly status: string;
+        readonly details?: Readonly<Record<string, unknown>>;
+      }[];
+    };
+    expect(metricsBody).not.toContain("nutsnews_worker_dependency_duration_ms");
+    expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
+    expect(metricsBody).toContain("nutsnews_worker_health_probe");
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="publication"} 0');
+    expect(metricsBody).toContain('outcome="ok",probe="liveness"} 1');
+    expect(metricsBody).toContain('outcome="ok",probe="startup"} 1');
+    expect(metricsBody).toContain('outcome="ok",probe="readiness"} 1');
+    expect(readyBody.checks.find((check) => check.name === "rabbitmq-consumer")).toMatchObject({
+      status: "ok",
+      details: {
+        activeConsumers: 1,
+        queue: "nutsnews.worker.publication.v1"
+      }
+    });
     const schemaBody = await schema.json() as {
       readonly variables: readonly { readonly name: string; readonly sensitive: boolean }[];
     };
